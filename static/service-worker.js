@@ -1,0 +1,1 @@
+const C='jws-final-v1';self.addEventListener('install',e=>e.waitUntil(caches.open(C).then(c=>c.addAll(['/static/styles.css','/static/app.js','/static/assets/jws-water-logo.png']))));self.addEventListener('fetch',e=>e.respondWith(fetch(e.request).catch(()=>caches.match(e.request))));

@@ -1,0 +1,12 @@
+{% extends "base.html" %}{% block body %}<div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/static/assets/jws-water-logo.png"></div><nav class="nav">
+<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a>
+{% if user.role=="manager" %}<div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a>{% endif %}
+<div class="spacer"></div><a href="/logout">↪ Logout</a></nav></aside><main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div></header><section class="content">
+<h1>Employees</h1><div class="card panel"><form method="post" class="employee-form">
+<input name="name" placeholder="Employee name" required><input name="username" placeholder="Username" required><input name="password" type="password" placeholder="Temporary password" required>
+<input name="normal_hours" type="number" step=".25" value="40" placeholder="Normal hours"><input name="basic_rate" type="number" step=".01" placeholder="Basic rate">
+<input name="ot1_start" type="number" step=".25" value="40" placeholder="OT1 starts after"><input name="ot1_rate" type="number" step=".01" placeholder="OT1 rate"><input name="ot2_start" type="number" step=".25" placeholder="OT2 starts after"><input name="ot2_rate" type="number" step=".01" placeholder="OT2 rate">
+<button class="btn primary">Add Employee</button></form></div>
+<div class="card panel"><table><tr><th>Name</th><th>Username</th><th>Normal</th><th>OT1</th><th>OT2</th><th>Status</th><th></th></tr>
+{% for r in rows %}<tr><td>{{r.name}}</td><td>{{r.username}}</td><td>{{r.normal_hours}}</td><td>{{r.ot1_start}} / £{{r.ot1_rate}}</td><td>{{r.ot2_start or "—"}} / £{{r.ot2_rate}}</td><td>{{"Active" if r.active else "Disabled"}}</td><td><form method="post" action="/employees/{{r.id}}/toggle"><button class="btn secondary">{{"Disable" if r.active else "Enable"}}</button></form></td></tr>{% endfor %}</table></div>
+</section></main></div>{% endblock %}

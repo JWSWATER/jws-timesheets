@@ -1,0 +1,75 @@
+JWS TIMESHEETS — RAILWAY DEPLOYMENT
+
+This package is ready for a central hosted deployment.
+
+WHAT CHANGED
+- PostgreSQL support using Railway's DATABASE_URL
+- SQLite fallback for local testing
+- Gunicorn production server
+- Railway health check at /health
+- Secure password hashing
+- CSRF protection
+- Secure session-cookie settings when running on Railway
+- No default demo employee on a production database
+- Production admin password supplied through an environment variable
+- Same JWS Water branded interface and Monday-Sunday timesheets
+
+FASTEST DEPLOYMENT — GITHUB + RAILWAY
+
+A. Put the project on GitHub
+1. Create a private GitHub repository called: jws-timesheets
+2. Upload ALL files/folders from this package into that repository.
+3. Do not upload your own .env file. The included .gitignore blocks it.
+
+B. Create Railway project
+1. Sign into Railway.
+2. New Project -> Deploy from GitHub repo.
+3. Select jws-timesheets.
+4. Railway will identify it as a Python app.
+
+C. Add PostgreSQL
+1. In the Railway project canvas click + New.
+2. Add PostgreSQL.
+3. In the JWS Timesheets web service Variables, add a reference to the PostgreSQL DATABASE_URL if Railway has not linked it automatically.
+   The application reads DATABASE_URL automatically.
+
+D. Add these VARIABLES to the JWS Timesheets service
+JWS_SECRET_KEY = a long random password/secret
+JWS_ADMIN_NAME = Jonathon Stevenson
+JWS_ADMIN_USERNAME = admin
+JWS_ADMIN_PASSWORD = your strong initial administrator password
+
+IMPORTANT:
+Set JWS_ADMIN_PASSWORD BEFORE the first successful production start.
+The application deliberately refuses to create the first production administrator without it.
+
+E. Deploy
+Railway should use railway.json and start:
+gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60
+
+F. Give it a web address
+1. Open the web service in Railway.
+2. Settings -> Networking.
+3. Generate Domain.
+4. Open the generated HTTPS address.
+5. Log in with JWS_ADMIN_USERNAME / JWS_ADMIN_PASSWORD.
+
+G. Add employees
+Manager View -> Employees.
+Create each employee username/password and overtime rules.
+
+CURRENT XERO STATUS
+The hosted database and Projects table are ready, but live Xero sync is not enabled yet.
+The next development step is to connect Xero Projects so active Xero projects automatically populate this table,
+then add approved time export to Xero Projects and the supported Xero Payroll workflow.
+
+ANDROID
+Once this Railway version is deployed at a stable HTTPS address, it becomes the central backend for the Android app.
+Do not publish the Android app before the hosted backend is working, because all employee phones must share the same database.
+
+SECURITY
+- Keep the GitHub repository private.
+- Never commit JWS_SECRET_KEY, JWS_ADMIN_PASSWORD or Xero secrets.
+- Railway variables are the correct place for secrets.
+- Change/disable employee accounts when staff leave.
+- Arrange PostgreSQL backups before relying on the system for payroll records.

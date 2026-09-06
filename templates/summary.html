@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block body %}<div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/static/assets/jws-water-logo.png"></div><nav class="nav">
+<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a><div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a><div class="spacer"></div><a href="/logout">↪ Logout</a></nav></aside>
+<main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div></header><section class="content">
+<h1>Full Timesheet Summary</h1><p><b>{{ employee.name }}</b> · Week {{ ts.week_start }}</p><div class="card panel">
+<table><tr><th>Date</th><th>Start</th><th>Finish</th><th>Project</th><th>Description</th></tr>
+{% for e in entries %}<tr><td>{{ e.work_date }}</td><td>{{ e.start_time }}</td><td>{{ e.finish_time }}</td><td>{{ e.project.name if e.project else "" }}</td><td>{{ e.description }}</td></tr>{% endfor %}</table>
+<p><b>Total:</b> {{"%.2f"|format(total)}} hrs · <b>Normal:</b> {{"%.2f"|format(normal)}} · <b>OT1:</b> {{"%.2f"|format(ot1)}} · <b>OT2:</b> {{"%.2f"|format(ot2)}}</p></div>
+</section></main></div>{% endblock %}

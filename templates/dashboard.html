@@ -1,0 +1,18 @@
+{% extends "base.html" %}{% block body %}<div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/static/assets/jws-water-logo.png"></div><nav class="nav">
+<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a>
+{% if user.role=="manager" %}<div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a>{% endif %}
+<div class="spacer"></div><a href="/logout">↪ Logout</a></nav></aside><main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div></header><section class="content">
+<h1>My Timesheet</h1><p class="muted">Week commencing {{ week }} · Monday to Sunday</p>
+<div class="weekline"><input id="weekStart" type="date" value="{{ week }}"></div>
+<form id="timesheetForm" data-week="{{ week }}" data-status="{{ timesheet.status }}">
+{% for d in days %}
+<div class="card day-card" data-date="{{ d.date }}"><div class="day-head"><h3>{{ d.label }}</h3><label>Break (mins)<input class="break-input" type="number" value="{{ d.break }}"></label><div class="day-total">0.00 hrs</div></div>
+<div class="entries"><div class="entry-head"><span>Start</span><span>Finish</span><span>Project</span><span>Description</span><span></span></div><div class="entry-list">
+{% for e in d.entries %}<div class="entry-row"><input type="time" class="start" value="{{ e.start_time if e else '' }}"><input type="time" class="finish" value="{{ e.finish_time if e else '' }}">
+<div class="project-wrap"><input class="project-search" data-project-id="{{ e.project_id if e else '' }}" value="{{ e.project.name if e and e.project else '' }}" placeholder="Type project name or ref"><div class="project-suggestions hidden"></div></div>
+<input class="description" value="{{ e.description if e else '' }}" placeholder="Description"><button type="button" class="delete-row">🗑</button></div>{% endfor %}
+</div><button type="button" class="add-row">＋ Add another</button></div></div>{% endfor %}
+<div class="card week-summary"><div><span>Week total</span><strong id="weekTotal">0.00 hrs</strong></div><div class="actions"><button type="button" id="saveDraft" class="btn secondary">Save Draft</button><button type="button" id="submitTimesheet" class="btn primary">Submit Timesheet</button></div></div>
+</form>
+<script>window.TIMESHEET_LOCKED={{ 'true' if timesheet.status in ['submitted','approved'] else 'false' }};</script>
+</section></main></div>{% endblock %}

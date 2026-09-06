@@ -1,0 +1,6 @@
+{% extends "base.html" %}{% block body %}
+<div class="login-screen"><div class="login-art"><img src="/static/assets/jws-water-logo.png"></div><section class="login-panel">
+<img src="/static/assets/jws-water-logo.png"><h1>Sign In</h1><p>Enter your details to continue.</p>
+{% with messages=get_flashed_messages() %}{% if messages %}<div class="error">{{ messages[0] }}</div>{% endif %}{% endwith %}
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">><input name="username" placeholder="Username" required><input type="password" name="password" placeholder="Password" required><button class="btn primary">Sign In</button></form>
+<div class="demo">Demo manager: <b>admin</b> / <b>admin123</b><br>Demo employee: <b>john</b> / <b>john123</b></div></section></div>{% endblock %}
