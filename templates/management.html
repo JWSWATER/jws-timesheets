@@ -1,7 +1,54 @@
-{% extends "base.html" %}{% block body %}<div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/static/assets/jws-water-logo.png"></div><nav class="nav">
-<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a>
-{% if user.role=="manager" %}<div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a>{% endif %}
-<div class="spacer"></div><a href="/logout">↪ Logout</a></nav></aside><main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div></header><section class="content">
-<h1>Manager View</h1><div class="card panel"><table><tr><th>Employee</th><th>Week</th><th>Total</th><th>Status</th><th>Summary</th><th>Action</th></tr>
-{% for r in rows %}<tr><td>{{r.employee_name}}</td><td>{{r.week_start}}</td><td>{{"%.2f"|format(r.total)}} hrs</td><td>{{r.status}}</td><td><a href="/timesheet/{{r.id}}">View summary</a></td><td>{% if r.status=="submitted" %}<form class="inline" method="post" action="/timesheet/{{r.id}}/approve"><button class="btn success">Approve</button></form> <form class="inline" method="post" action="/timesheet/{{r.id}}/reject"><button class="btn danger">Reject</button></form>{% else %}—{% endif %}</td></tr>{% endfor %}</table></div>
-</section></main></div>{% endblock %}
+{% extends "base.html" %}{% block body %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><img src="/static/assets/jws-water-logo.png" alt="JWS Water"></div>
+    <nav class="nav">
+      <a href="/dashboard">▣ My Timesheet</a>
+      <a href="/history">◷ History</a>
+      {% if user.role=="manager" %}
+        <div class="spacer"></div>
+        <a href="/management">👥 Manager View</a>
+        <a href="/employees">👤 Employees</a>
+        <a href="/projects">▦ Projects</a>
+        <a href="/settings">⚙ Settings</a>
+      {% endif %}
+      <div class="spacer"></div>
+      <a href="/logout">↪ Logout</a>
+    </nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div>
+    </header>
+    <section class="content">
+      <h1>Manager View</h1>
+      <div class="card panel">
+        <table>
+          <tr><th>Employee</th><th>Week</th><th>Total</th><th>Status</th><th>Summary</th><th>Action</th></tr>
+          {% for r in rows %}
+          <tr>
+            <td>{{r.employee_name}}</td>
+            <td>{{r.week_start}}</td>
+            <td>{{"%.2f"|format(r.total)}} hrs</td>
+            <td>{{r.status}}</td>
+            <td><a href="/timesheet/{{r.id}}">View summary</a></td>
+            <td>
+              {% if r.status=="submitted" %}
+                <form class="inline" method="post" action="/timesheet/{{r.id}}/approve">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <button class="btn success" type="submit">Approve</button>
+                </form>
+                <form class="inline" method="post" action="/timesheet/{{r.id}}/reject">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <button class="btn danger" type="submit">Reject</button>
+                </form>
+              {% else %}—{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+{% endblock %}
