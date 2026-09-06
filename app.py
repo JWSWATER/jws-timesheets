@@ -2,6 +2,8 @@
 import os
 import base64
 import json
+import hashlib
+import math
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -53,6 +55,8 @@ class User(db.Model):
     standard_day_hours = db.Column(db.Float, nullable=False, default=8)
     mon_thu_hours = db.Column(db.Float, nullable=False, default=8.5)
     friday_hours = db.Column(db.Float, nullable=False, default=6)
+    xero_project_user_id = db.Column(db.String(120), nullable=True, index=True)
+    xero_project_user_name = db.Column(db.String(200), nullable=True)
 
 class Project(db.Model):
     __tablename__ = "projects"
@@ -76,6 +80,8 @@ class Timesheet(db.Model):
     submitted_at = db.Column(db.DateTime, nullable=True)
     approved_at = db.Column(db.DateTime, nullable=True)
     rejected_at = db.Column(db.DateTime, nullable=True)
+    xero_projects_exported_at = db.Column(db.DateTime, nullable=True)
+    xero_projects_export_error = db.Column(db.String(1200), nullable=True)
     user = db.relationship("User")
     __table_args__ = (db.UniqueConstraint("user_id", "week_start", name="uq_user_week"),)
 
@@ -88,6 +94,9 @@ class Entry(db.Model):
     finish_time = db.Column(db.String(5), nullable=True)
     project_id = db.Column(db.Integer, db.ForeignKey("projects.id"), nullable=True)
     description = db.Column(db.String(1000), nullable=True)
+    xero_task_id = db.Column(db.String(120), nullable=True)
+    xero_time_entry_id = db.Column(db.String(120), nullable=True, index=True)
+    xero_exported_at = db.Column(db.DateTime, nullable=True)
     project = db.relationship("Project")
 
 class DayPaidHours(db.Model):
@@ -128,6 +137,45 @@ def init_db():
             with db.engine.begin() as conn:
                 conn.exec_driver_sql(
                     "ALTER TABLE users ADD COLUMN friday_hours FLOAT NOT NULL DEFAULT 6"
+                )
+        if "xero_project_user_id" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN xero_project_user_id VARCHAR(120)"
+                )
+        if "xero_project_user_name" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN xero_project_user_name VARCHAR(200)"
+                )
+
+        entry_columns = {c["name"] for c in inspector.get_columns("entries")}
+        if "xero_task_id" not in entry_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE entries ADD COLUMN xero_task_id VARCHAR(120)"
+                )
+        if "xero_time_entry_id" not in entry_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE entries ADD COLUMN xero_time_entry_id VARCHAR(120)"
+                )
+        if "xero_exported_at" not in entry_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE entries ADD COLUMN xero_exported_at TIMESTAMP"
+                )
+
+        timesheet_columns = {c["name"] for c in inspector.get_columns("timesheets")}
+        if "xero_projects_exported_at" not in timesheet_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE timesheets ADD COLUMN xero_projects_exported_at TIMESTAMP"
+                )
+        if "xero_projects_export_error" not in timesheet_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE timesheets ADD COLUMN xero_projects_export_error VARCHAR(1200)"
                 )
     except Exception:
         db.session.rollback()
@@ -319,6 +367,33 @@ def save_timesheet():
     if ts.status in ("submitted", "approved"):
         return jsonify({"ok": False, "error": "Timesheet is locked"}), 400
 
+    # On final submission, every worked row must be complete. The description
+    # becomes the Xero Project task name after manager approval.
+    if data.get("submit"):
+        for day in data.get("days", []):
+            for row in day.get("entries", []):
+                has_any = any([
+                    row.get("start"), row.get("finish"),
+                    row.get("projectId"), row.get("description")
+                ])
+                if not has_any:
+                    continue
+                if not row.get("start") or not row.get("finish"):
+                    return jsonify({
+                        "ok": False,
+                        "error": f"{day.get('date')}: enter both Start and Finish."
+                    }), 400
+                if not row.get("projectId"):
+                    return jsonify({
+                        "ok": False,
+                        "error": f"{day.get('date')}: select a Project."
+                    }), 400
+                if not (row.get("description") or "").strip():
+                    return jsonify({
+                        "ok": False,
+                        "error": f"{day.get('date')}: enter a Description. This will become the Xero task name."
+                    }), 400
+
     Entry.query.filter_by(timesheet_id=ts.id).delete()
     Break.query.filter_by(timesheet_id=ts.id).delete()
     DayPaidHours.query.filter_by(timesheet_id=ts.id).delete()
@@ -362,7 +437,8 @@ def save_timesheet():
 
 
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
-XERO_PROJECTS_URL = "https://api.xero.com/projects.xro/2.0/projects"
+XERO_PROJECTS_BASE_URL = "https://api.xero.com/projects.xro/2.0"
+XERO_PROJECTS_URL = f"{XERO_PROJECTS_BASE_URL}/Projects"
 
 def xero_is_configured():
     return bool(os.environ.get("XERO_CLIENT_ID") and os.environ.get("XERO_CLIENT_SECRET"))
@@ -401,6 +477,293 @@ def xero_access_token():
     if not token:
         raise RuntimeError("Xero did not return an access token.")
     return token
+
+def xero_api_request(method, path, token=None, body=None, query=None, idempotency_key=None):
+    """Call the Xero Projects API for this Custom Connection."""
+    token = token or xero_access_token()
+    url = f"{XERO_PROJECTS_BASE_URL}{path}"
+    if query:
+        url += "?" + urlencode(query)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key[:128]
+
+    req = Request(url, data=data, method=method.upper(), headers=headers)
+    try:
+        with urlopen(req, timeout=35) as response:
+            raw = response.read().decode("utf-8")
+            if not raw:
+                return None
+            return json.loads(raw)
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Xero Projects API failed ({exc.code}) on {method.upper()} {path}: {detail[:700]}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not contact Xero Projects: {exc.reason}") from exc
+
+
+def xero_get_project_users(token=None):
+    token = token or xero_access_token()
+    users = []
+    page = 1
+    while True:
+        payload = xero_api_request(
+            "GET",
+            "/ProjectsUsers",
+            token=token,
+            query={"page": page, "pageSize": 500},
+        ) or {}
+        users.extend(payload.get("items") or [])
+        pagination = payload.get("pagination") or {}
+        page_count = int(pagination.get("pageCount") or 1)
+        if page >= page_count:
+            break
+        page += 1
+    return users
+
+
+def xero_get_project_tasks(project_id, token=None):
+    token = token or xero_access_token()
+    tasks = []
+    page = 1
+    while True:
+        payload = xero_api_request(
+            "GET",
+            f"/Projects/{project_id}/Tasks",
+            token=token,
+            query={"page": page, "pageSize": 500},
+        ) or {}
+        tasks.extend(payload.get("items") or [])
+        pagination = payload.get("pagination") or {}
+        page_count = int(pagination.get("pageCount") or 1)
+        if page >= page_count:
+            break
+        page += 1
+    return tasks
+
+
+def _xero_idempotency(prefix, value):
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"jws-{prefix}-{digest}"[:128]
+
+
+def xero_find_or_create_task(project_id, description, token=None):
+    """
+    Reuse an active task when its name exactly matches the timesheet
+    description. Otherwise create a new task from the description.
+    """
+    token = token or xero_access_token()
+    full_description = (description or "").strip()
+    if not full_description:
+        raise RuntimeError("A timesheet description is required before it can be sent to Xero.")
+
+    # Xero Project task names are limited to 100 characters.
+    task_name = full_description[:100]
+    wanted = task_name.casefold()
+
+    for task in xero_get_project_tasks(project_id, token=token):
+        if (
+            (task.get("name") or "").strip().casefold() == wanted
+            and (task.get("status") or "ACTIVE") == "ACTIVE"
+        ):
+            return task
+
+    # Safe default: a newly generated task is non-chargeable at £0.
+    # Existing Xero tasks retain whatever charge settings they already have.
+    charge_type = os.environ.get("XERO_TASK_CHARGE_TYPE", "NON_CHARGEABLE").strip().upper()
+    if charge_type not in ("NON_CHARGEABLE", "TIME"):
+        charge_type = "NON_CHARGEABLE"
+
+    try:
+        rate_value = float(os.environ.get("XERO_TASK_RATE", "0"))
+    except ValueError:
+        rate_value = 0.0
+
+    currency = os.environ.get("XERO_TASK_CURRENCY", "GBP").strip().upper() or "GBP"
+    body = {
+        "name": task_name,
+        "rate": {"currency": currency, "value": rate_value},
+        "chargeType": charge_type,
+    }
+    return xero_api_request(
+        "POST",
+        f"/Projects/{project_id}/Tasks",
+        token=token,
+        body=body,
+        idempotency_key=_xero_idempotency("task", f"{project_id}|{wanted}"),
+    )
+
+
+def xero_resolve_project_user(employee, token=None):
+    """
+    Use the manager-selected mapping when available. Otherwise try a safe
+    exact-name match once and store it for future exports.
+    """
+    if employee.xero_project_user_id:
+        return employee.xero_project_user_id
+
+    token = token or xero_access_token()
+    matches = [
+        u for u in xero_get_project_users(token=token)
+        if (u.get("name") or "").strip().casefold() == employee.name.strip().casefold()
+    ]
+    if len(matches) == 1:
+        employee.xero_project_user_id = matches[0].get("userId")
+        employee.xero_project_user_name = matches[0].get("name")
+        db.session.commit()
+        return employee.xero_project_user_id
+
+    raise RuntimeError(
+        f"{employee.name} is not mapped to a Xero Projects user. "
+        "Open Employees and select their Xero Projects user."
+    )
+
+
+def hhmm_minutes(start, finish):
+    if not start or not finish:
+        return 0
+    sh, sm = map(int, start.split(":"))
+    fh, fm = map(int, finish.split(":"))
+    mins = (fh * 60 + fm) - (sh * 60 + sm)
+    if mins < 0:
+        mins += 1440
+    return mins
+
+
+def allocate_day_break(entry_rows, break_minutes):
+    """
+    Allocate the day's single break proportionally across worked rows.
+    This keeps Xero Project minutes equal to the approved JWS worked total.
+    """
+    gross = [hhmm_minutes(e.start_time, e.finish_time) for e in entry_rows]
+    if any(m <= 0 for m in gross):
+        raise RuntimeError("A worked row has zero or invalid duration.")
+
+    total_gross = sum(gross)
+    break_minutes = max(0, int(break_minutes or 0))
+    net_total = total_gross - break_minutes
+    if net_total <= 0:
+        raise RuntimeError("Break minutes cannot equal or exceed all worked time for the day.")
+    if net_total < len(entry_rows):
+        raise RuntimeError("There is not enough net time to export every worked row to Xero.")
+
+    # Guarantee at least one minute per row, then allocate the remainder
+    # proportionally using largest-remainder rounding.
+    remaining = net_total - len(entry_rows)
+    raw_extra = [(remaining * m / total_gross) for m in gross]
+    extras = [math.floor(x) for x in raw_extra]
+    leftover = remaining - sum(extras)
+    order = sorted(
+        range(len(entry_rows)),
+        key=lambda i: raw_extra[i] - extras[i],
+        reverse=True,
+    )
+    for i in order[:leftover]:
+        extras[i] += 1
+
+    return {entry_rows[i].id: 1 + extras[i] for i in range(len(entry_rows))}
+
+
+def export_timesheet_to_xero_projects(ts):
+    if ts.status != "approved":
+        raise RuntimeError("Only approved timesheets can be sent to Xero Projects.")
+    if not xero_is_configured():
+        raise RuntimeError("Xero is not configured in Railway.")
+
+    token = xero_access_token()
+    xero_user_id = xero_resolve_project_user(ts.user, token=token)
+
+    entries = Entry.query.filter_by(timesheet_id=ts.id).order_by(Entry.work_date, Entry.id).all()
+    if not entries:
+        ts.xero_projects_exported_at = datetime.utcnow()
+        ts.xero_projects_export_error = None
+        db.session.commit()
+        return 0
+
+    breaks = {r.work_date: r.minutes for r in Break.query.filter_by(timesheet_id=ts.id).all()}
+    entries_by_day = {}
+    for entry in entries:
+        entries_by_day.setdefault(entry.work_date, []).append(entry)
+
+    net_minutes = {}
+    for work_date, rows in entries_by_day.items():
+        net_minutes.update(allocate_day_break(rows, breaks.get(work_date, 0)))
+
+    sent = 0
+    try:
+        for entry in entries:
+            if entry.xero_time_entry_id:
+                continue
+
+            if not entry.project or not entry.project.external_id or entry.project.source != "xero":
+                raise RuntimeError(
+                    f"{entry.work_date}: project '{entry.project.name if entry.project else 'Unknown'}' "
+                    "is not linked to a Xero Project."
+                )
+
+            description = (entry.description or "").strip()
+            if not description:
+                raise RuntimeError(f"{entry.work_date}: a Description is required for Xero task creation.")
+
+            project_id = entry.project.external_id
+            task = xero_find_or_create_task(project_id, description, token=token)
+            task_id = (task or {}).get("taskId")
+            if not task_id:
+                raise RuntimeError(f"Xero did not return a Task ID for '{description[:100]}'.")
+
+            duration = int(net_minutes.get(entry.id) or 0)
+            if duration < 1:
+                raise RuntimeError(f"{entry.work_date}: calculated Xero duration is less than one minute.")
+
+            payload = {
+                "userId": xero_user_id,
+                "taskId": task_id,
+                "dateUtc": f"{entry.work_date}T12:00:00Z",
+                "duration": duration,
+                "description": description,
+            }
+            created = xero_api_request(
+                "POST",
+                f"/Projects/{project_id}/Time",
+                token=token,
+                body=payload,
+                idempotency_key=_xero_idempotency("time", f"entry-{entry.id}"),
+            ) or {}
+
+            time_entry_id = created.get("timeEntryId")
+            if not time_entry_id:
+                raise RuntimeError(
+                    f"Xero did not return a Time Entry ID for the entry on {entry.work_date}."
+                )
+
+            entry.xero_task_id = task_id
+            entry.xero_time_entry_id = time_entry_id
+            entry.xero_exported_at = datetime.utcnow()
+            db.session.commit()
+            sent += 1
+
+        ts.xero_projects_exported_at = datetime.utcnow()
+        ts.xero_projects_export_error = None
+        db.session.commit()
+        return sent
+
+    except Exception as exc:
+        db.session.rollback()
+        ts = db.session.get(Timesheet, ts.id)
+        ts.xero_projects_export_error = str(exc)[:1200]
+        db.session.commit()
+        raise
+
 
 def xero_get_active_projects():
     token = xero_access_token()
@@ -564,10 +927,29 @@ def history():
 def management():
     u = current_user()
     sheets = Timesheet.query.filter(Timesheet.status != "draft").order_by(Timesheet.week_start.desc()).all()
-    rows = [{
-        "id": r.id, "employee_name": r.user.name, "week_start": r.week_start,
-        "status": r.status, "total": timesheet_total(r.id)
-    } for r in sheets]
+    rows = []
+    for r in sheets:
+        project_entries = [
+            e for e in Entry.query.filter_by(timesheet_id=r.id).all()
+            if e.project and e.project.source == "xero"
+        ]
+        if project_entries and all(e.xero_time_entry_id for e in project_entries):
+            xero_status = "Sent"
+        elif r.status == "approved" and project_entries:
+            xero_status = "Pending"
+        elif not project_entries:
+            xero_status = "No project time"
+        else:
+            xero_status = "—"
+
+        rows.append({
+            "id": r.id,
+            "employee_name": r.user.name,
+            "week_start": r.week_start,
+            "status": r.status,
+            "total": timesheet_total(r.id),
+            "xero_status": xero_status,
+        })
     return render_template("management.html", user=u, rows=rows)
 
 @app.get("/timesheet/<int:tsid>")
@@ -590,12 +972,17 @@ def timesheet_summary(tsid):
     ot2_start = employee.ot2_start
     ot1 = max(0, min(worked_total, ot2_start if ot2_start else worked_total) - employee.ot1_start)
     ot2 = max(0, worked_total - ot2_start) if ot2_start else 0
+    project_entries = [e for e in entries if e.project and e.project.source == "xero"]
+    xero_sent_count = sum(1 for e in project_entries if e.xero_time_entry_id)
     return render_template(
         "summary.html", user=u, ts=ts, employee=employee, entries=entries,
         breaks=break_map, paid_rows=paid_rows,
         worked_total=worked_total, annual_leave_total=annual_leave_total,
         public_holiday_total=public_holiday_total,
-        total=total, normal=normal, ot1=ot1, ot2=ot2
+        total=total, normal=normal, ot1=ot1, ot2=ot2,
+        project_entry_count=len(project_entries),
+        xero_sent_count=xero_sent_count,
+        xero_configured=xero_is_configured(),
     )
 
 @app.post("/timesheet/<int:tsid>/<action>")
@@ -607,11 +994,48 @@ def timesheet_action(tsid, action):
     if action == "approve":
         ts.status = "approved"
         ts.approved_at = datetime.utcnow()
+        db.session.commit()
+
+        if xero_is_configured():
+            try:
+                sent = export_timesheet_to_xero_projects(ts)
+                flash(
+                    f"Timesheet approved. {sent} new Xero Project time entr{'y' if sent == 1 else 'ies'} sent.",
+                    "success",
+                )
+            except Exception as exc:
+                flash(
+                    f"Timesheet approved, but Xero Projects export needs attention: {exc}",
+                    "error",
+                )
+        else:
+            flash("Timesheet approved. Xero is not configured, so no project time was sent.", "error")
+        return redirect(url_for("management"))
+
     elif action == "reject":
         ts.status = "draft"
         ts.rejected_at = datetime.utcnow()
-    db.session.commit()
-    return redirect(url_for("management"))
+        db.session.commit()
+        return redirect(url_for("management"))
+
+    return "Invalid action", 400
+
+@app.post("/timesheet/<int:tsid>/export-xero")
+@manager_required
+def timesheet_export_xero(tsid):
+    ts = db.session.get(Timesheet, tsid)
+    if not ts:
+        return "Not found", 404
+    try:
+        sent = export_timesheet_to_xero_projects(ts)
+        flash(
+            f"Xero Projects export complete. {sent} new time entr{'y' if sent == 1 else 'ies'} sent.",
+            "success",
+        )
+    except Exception as exc:
+        flash(f"Xero Projects export failed: {exc}", "error")
+    return redirect(url_for("timesheet_summary", tsid=tsid))
+
 
 @app.route("/employees", methods=["GET", "POST"])
 @manager_required
@@ -639,7 +1063,55 @@ def employees():
             db.session.commit()
             return redirect(url_for("employees"))
     rows = User.query.filter_by(role="employee").order_by(User.name).all()
-    return render_template("employees.html", user=u, rows=rows)
+    xero_users = []
+    xero_users_error = None
+    if xero_is_configured():
+        try:
+            xero_users = sorted(
+                xero_get_project_users(),
+                key=lambda item: (item.get("name") or "").casefold()
+            )
+        except Exception as exc:
+            xero_users_error = str(exc)
+
+    return render_template(
+        "employees.html",
+        user=u,
+        rows=rows,
+        xero_users=xero_users,
+        xero_users_error=xero_users_error,
+    )
+
+@app.post("/employees/<int:uid>/xero-user")
+@manager_required
+def employee_xero_user(uid):
+    employee = db.session.get(User, uid)
+    if not employee or employee.role != "employee":
+        return "Not found", 404
+
+    selected_id = (request.form.get("xero_project_user_id") or "").strip()
+    if not selected_id:
+        employee.xero_project_user_id = None
+        employee.xero_project_user_name = None
+        db.session.commit()
+        flash(f"Cleared Xero Projects user mapping for {employee.name}.", "success")
+        return redirect(url_for("employees"))
+
+    try:
+        xero_users = xero_get_project_users()
+        match = next((u for u in xero_users if u.get("userId") == selected_id), None)
+        if not match:
+            raise RuntimeError("That Xero Projects user could not be found.")
+        employee.xero_project_user_id = selected_id
+        employee.xero_project_user_name = match.get("name")
+        db.session.commit()
+        flash(f"{employee.name} mapped to Xero Projects user {match.get('name')}.", "success")
+    except Exception as exc:
+        db.session.rollback()
+        flash(f"Could not save Xero user mapping: {exc}", "error")
+
+    return redirect(url_for("employees"))
+
 
 @app.post("/employees/<int:uid>/toggle")
 @manager_required

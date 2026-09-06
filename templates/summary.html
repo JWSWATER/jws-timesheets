@@ -2,8 +2,15 @@
 <a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a><div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a><div class="spacer"></div><a href="/change-password">🔒 Change Password</a><a href="/logout">↪ Logout</a></nav></aside>
 <main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div></header><section class="content">
 <h1>Full Timesheet Summary</h1><p><b>{{ employee.name }}</b> · Week {{ ts.week_start }}</p><div class="card panel">
-<table><tr><th>Date</th><th>Start</th><th>Finish</th><th>Project</th><th>Description</th></tr>
-{% for e in entries %}<tr><td>{{ e.work_date }}</td><td>{{ e.start_time }}</td><td>{{ e.finish_time }}</td><td>{{ e.project.name if e.project else "" }}</td><td>{{ e.description }}</td></tr>{% endfor %}</table>
+<table><tr><th>Date</th><th>Start</th><th>Finish</th><th>Project</th><th>Description / Xero Task</th><th>Xero</th></tr>
+{% for e in entries %}<tr>
+<td>{{ e.work_date }}</td>
+<td>{{ e.start_time }}</td>
+<td>{{ e.finish_time }}</td>
+<td>{{ e.project.name if e.project else "" }}</td>
+<td>{{ e.description }}</td>
+<td>{% if e.xero_time_entry_id %}Sent{% elif e.project and e.project.source=="xero" %}Pending{% else %}—{% endif %}</td>
+</tr>{% endfor %}</table>
 {% if paid_rows %}
 <h3 style="margin-top:22px">Annual Leave & Public Holidays</h3>
 <table>
@@ -29,5 +36,20 @@
 <b>Normal Worked:</b> {{"%.2f"|format(normal)}} hrs ·
 <b>OT1:</b> {{"%.2f"|format(ot1)}} hrs ·
 <b>OT2:</b> {{"%.2f"|format(ot2)}} hrs
-</p></div>
+</p>
+{% if ts.status=="approved" %}
+<div class="xero-export-panel">
+  <p><b>Xero Projects:</b> {{ xero_sent_count }} of {{ project_entry_count }} project time entries sent.</p>
+  {% if ts.xero_projects_export_error %}
+    <div class="error">{{ ts.xero_projects_export_error }}</div>
+  {% endif %}
+  {% if xero_configured and xero_sent_count < project_entry_count %}
+  <form method="post" action="/timesheet/{{ts.id}}/export-xero">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn primary" type="submit">Send Pending Time to Xero Projects</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+</div>
 </section></main></div>{% endblock %}

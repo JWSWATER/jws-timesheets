@@ -23,6 +23,9 @@
     </header>
     <section class="content">
       <h1>Employees</h1>
+      {% if xero_users_error %}
+      <div class="card panel"><div class="error">Could not load Xero Projects users: {{ xero_users_error }}</div></div>
+      {% endif %}
       <div class="card panel">
         {% with messages=get_flashed_messages() %}
           {% if messages %}<div class="error">{{ messages[0] }}</div>{% endif %}
@@ -45,7 +48,7 @@
       </div>
       <div class="card panel">
         <table>
-          <tr><th>Name</th><th>Username</th><th>Normal</th><th>Mon–Thu</th><th>Friday</th><th>OT1</th><th>OT2</th><th>Status</th><th></th></tr>
+          <tr><th>Name</th><th>Username</th><th>Normal</th><th>Mon–Thu</th><th>Friday</th><th>OT1</th><th>OT2</th><th>Xero Projects user</th><th>Status</th><th></th></tr>
           {% for r in rows %}
           <tr>
             <td>{{r.name}}</td>
@@ -55,6 +58,24 @@
             <td>{{ "%.2f"|format(r.friday_hours or 6) }} hrs</td>
             <td>{{r.ot1_start}} / £{{r.ot1_rate}}</td>
             <td>{{r.ot2_start or "—"}} / £{{r.ot2_rate}}</td>
+            <td>
+              {% if xero_users %}
+              <form method="post" action="/employees/{{r.id}}/xero-user" class="xero-user-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <select name="xero_project_user_id">
+                  <option value="">Not mapped</option>
+                  {% for xu in xero_users %}
+                  <option value="{{ xu.userId }}" {% if r.xero_project_user_id==xu.userId %}selected{% endif %}>{{ xu.name }}</option>
+                  {% endfor %}
+                </select>
+                <button class="btn secondary" type="submit">Save</button>
+              </form>
+              {% elif r.xero_project_user_name %}
+                {{ r.xero_project_user_name }}
+              {% else %}
+                —
+              {% endif %}
+            </td>
             <td>{{"Active" if r.active else "Disabled"}}</td>
             <td>
               <form method="post" action="/employees/{{r.id}}/toggle">

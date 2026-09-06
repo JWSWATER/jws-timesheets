@@ -30,3 +30,9 @@
 .password-form label{font-size:13px;font-weight:700;color:var(--muted)}
 .password-form input{display:block;width:100%;margin-top:6px;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
 .password-form .btn{min-width:170px}
+
+/* Xero Projects employee mapping and export */
+.xero-user-form{display:flex;align-items:center;gap:6px;min-width:250px}
+.xero-user-form select{min-width:160px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.xero-export-panel{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
+@media(max-width:900px){.xero-user-form{min-width:210px}.xero-user-form select{min-width:130px}}
