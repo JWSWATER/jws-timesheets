@@ -1,5 +1,10 @@
 
 import os
+import base64
+import json
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from datetime import datetime, date, timedelta
 from functools import wraps
 
@@ -261,6 +266,82 @@ def save_timesheet():
     db.session.commit()
     return jsonify({"ok": True})
 
+
+XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
+XERO_PROJECTS_URL = "https://api.xero.com/projects.xro/2.0/projects"
+
+def xero_is_configured():
+    return bool(os.environ.get("XERO_CLIENT_ID") and os.environ.get("XERO_CLIENT_SECRET"))
+
+def xero_access_token():
+    client_id = os.environ.get("XERO_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("XERO_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError("Xero Client ID and Client Secret have not been configured in Railway.")
+
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    body = urlencode({
+        "grant_type": "client_credentials",
+        "scope": "projects"
+    }).encode("utf-8")
+    req = Request(
+        XERO_TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(req, timeout=25) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Xero authentication failed ({exc.code}): {detail[:400]}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not contact Xero: {exc.reason}") from exc
+
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError("Xero did not return an access token.")
+    return token
+
+def xero_get_active_projects():
+    token = xero_access_token()
+    all_items = []
+    page = 1
+
+    while True:
+        query = urlencode({"states": "INPROGRESS", "page": page, "pageSize": 500})
+        req = Request(
+            f"{XERO_PROJECTS_URL}?{query}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(req, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Xero Projects request failed ({exc.code}): {detail[:500]}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not contact Xero Projects: {exc.reason}") from exc
+
+        items = payload.get("items", [])
+        all_items.extend(items)
+
+        pagination = payload.get("pagination") or {}
+        page_count = int(pagination.get("pageCount") or 1)
+        if page >= page_count:
+            break
+        page += 1
+
+    return all_items
+
 @app.get("/api/projects")
 @login_required
 def api_projects():
@@ -363,12 +444,70 @@ def employee_toggle(uid):
 @manager_required
 def projects_page():
     rows = Project.query.filter_by(active=True).order_by(Project.name).all()
-    return render_template("projects.html", user=current_user(), rows=rows)
+    return render_template(
+        "projects.html",
+        user=current_user(),
+        rows=rows,
+        xero_configured=xero_is_configured(),
+        xero_count=Project.query.filter_by(active=True, source="xero").count(),
+    )
+
+@app.post("/projects/sync-xero")
+@manager_required
+def projects_sync_xero():
+    if not xero_is_configured():
+        flash("Add XERO_CLIENT_ID and XERO_CLIENT_SECRET in Railway before syncing.", "error")
+        return redirect(url_for("projects_page"))
+
+    try:
+        xero_projects = xero_get_active_projects()
+        seen = set()
+
+        # Only deactivate previously synced Xero projects after a successful API response.
+        existing_xero = Project.query.filter_by(source="xero").all()
+        existing_by_external = {p.external_id: p for p in existing_xero if p.external_id}
+
+        for item in xero_projects:
+            external_id = (item.get("projectId") or "").strip()
+            name = (item.get("name") or "").strip()
+            if not external_id or not name:
+                continue
+
+            seen.add(external_id)
+            project = existing_by_external.get(external_id)
+            if project is None:
+                project = Project(
+                    external_id=external_id,
+                    name=name,
+                    active=True,
+                    source="xero",
+                )
+                db.session.add(project)
+            else:
+                project.name = name
+                project.active = True
+                project.source = "xero"
+
+        for project in existing_xero:
+            if project.external_id not in seen:
+                project.active = False
+
+        db.session.commit()
+        flash(f"Xero sync complete: {len(seen)} active project(s) imported.", "success")
+    except Exception as exc:
+        db.session.rollback()
+        flash(str(exc), "error")
+
+    return redirect(url_for("projects_page"))
 
 @app.get("/settings")
 @manager_required
 def settings():
-    return render_template("settings.html", user=current_user())
+    return render_template(
+        "settings.html",
+        user=current_user(),
+        xero_configured=xero_is_configured(),
+    )
 
 with app.app_context():
     init_db()

@@ -1,6 +1,36 @@
-{% extends "base.html" %}{% block body %}<div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/static/assets/jws-water-logo.png"></div><nav class="nav">
-<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a>
-{% if user.role=="manager" %}<div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a>{% endif %}
-<div class="spacer"></div><a href="/logout">↪ Logout</a></nav></aside><main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div></header><section class="content">
-<h1>Settings</h1><div class="card panel"><div class="notice"><b>Xero connection:</b> not connected yet. Enter the Xero API credentials during deployment to enable live project sync and approved time export.</div></div>
-</section></main></div>{% endblock %}
+{% extends "base.html" %}{% block body %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><img src="/static/assets/jws-water-logo.png" alt="JWS Water"></div>
+    <nav class="nav">
+      <a href="/dashboard">▣ My Timesheet</a>
+      <a href="/history">◷ History</a>
+      <div class="spacer"></div>
+      <a href="/management">👥 Manager View</a>
+      <a href="/employees">👤 Employees</a>
+      <a href="/projects">▦ Projects</a>
+      <a href="/settings">⚙ Settings</a>
+      <div class="spacer"></div>
+      <a href="/logout">↪ Logout</a>
+    </nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div><strong>Welcome, {{ user.name }}</strong><div class="muted">Manager</div></div>
+    </header>
+    <section class="content">
+      <h1>Settings</h1>
+      <div class="card panel">
+        <div class="notice">
+          <b>Xero Projects connection:</b>
+          {% if xero_configured %}
+            credentials are configured. Go to <a href="/projects"><b>Projects</b></a> and select <b>Sync from Xero</b>.
+          {% else %}
+            not configured. Add <b>XERO_CLIENT_ID</b> and <b>XERO_CLIENT_SECRET</b> to the Railway web service.
+          {% endif %}
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+{% endblock %}

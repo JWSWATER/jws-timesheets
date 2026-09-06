@@ -1,6 +1,63 @@
-{% extends "base.html" %}{% block body %}<div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/static/assets/jws-water-logo.png"></div><nav class="nav">
-<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a>
-{% if user.role=="manager" %}<div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a>{% endif %}
-<div class="spacer"></div><a href="/logout">↪ Logout</a></nav></aside><main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div></header><section class="content">
-<h1>Projects</h1><p class="muted">This list is the integration point for Xero Projects.</p><div class="card panel"><table><tr><th>Ref</th><th>Project</th><th>Source</th></tr>{% for r in rows %}<tr><td>{{r.external_id}}</td><td>{{r.name}}</td><td>{{r.source}}</td></tr>{% endfor %}</table></div>
-</section></main></div>{% endblock %}
+{% extends "base.html" %}{% block body %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><img src="/static/assets/jws-water-logo.png" alt="JWS Water"></div>
+    <nav class="nav">
+      <a href="/dashboard">▣ My Timesheet</a>
+      <a href="/history">◷ History</a>
+      <div class="spacer"></div>
+      <a href="/management">👥 Manager View</a>
+      <a href="/employees">👤 Employees</a>
+      <a href="/projects">▦ Projects</a>
+      <a href="/settings">⚙ Settings</a>
+      <div class="spacer"></div>
+      <a href="/logout">↪ Logout</a>
+    </nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div><strong>Welcome, {{ user.name }}</strong><div class="muted">Manager</div></div>
+    </header>
+    <section class="content">
+      <h1>Projects</h1>
+      <p class="muted">Active projects used in employee timesheets.</p>
+
+      {% with messages=get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, message in messages %}
+            <div class="{{ 'error' if category == 'error' else 'notice' }}" style="margin-bottom:14px">{{ message }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      <div class="card panel" style="margin-bottom:16px;display:flex;justify-content:space-between;gap:18px;align-items:center;flex-wrap:wrap">
+        <div>
+          <strong>Xero Projects</strong>
+          <div class="muted" style="margin-top:4px">
+            {% if xero_configured %}
+              Xero credentials configured · {{ xero_count }} active Xero project(s) currently stored.
+            {% else %}
+              Xero credentials have not been added to Railway yet.
+            {% endif %}
+          </div>
+        </div>
+        <form method="post" action="/projects/sync-xero">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="btn primary" type="submit" {% if not xero_configured %}disabled{% endif %}>Sync from Xero</button>
+        </form>
+      </div>
+
+      <div class="card panel">
+        <table>
+          <tr><th>Project</th><th>Source</th></tr>
+          {% for r in rows %}
+            <tr><td>{{ r.name }}</td><td>{{ "Xero" if r.source=="xero" else r.source|title }}</td></tr>
+          {% else %}
+            <tr><td colspan="2">No active projects have been synced yet.</td></tr>
+          {% endfor %}
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+{% endblock %}
