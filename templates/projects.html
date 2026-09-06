@@ -35,7 +35,7 @@
           <strong>Xero Projects</strong>
           <div class="muted" style="margin-top:4px">
             {% if xero_configured %}
-              Xero credentials configured · {{ xero_count }} active Xero project(s) currently stored.
+              Automatic sync enabled (about every {{ xero_sync_minutes }} minutes) · {{ xero_count }} active Xero project(s) currently stored.{% if xero_last_sync %}<br>Last successful sync: {{ xero_last_sync[:19].replace("T", " ") }} UTC{% endif %}
             {% else %}
               Xero credentials have not been added to Railway yet.
             {% endif %}

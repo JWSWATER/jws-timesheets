@@ -59,6 +59,11 @@ class Project(db.Model):
     active = db.Column(db.Boolean, nullable=False, default=True)
     source = db.Column(db.String(40), nullable=False, default="local")
 
+class AppSetting(db.Model):
+    __tablename__ = "app_settings"
+    key = db.Column(db.String(120), primary_key=True)
+    value = db.Column(db.Text, nullable=True)
+
 class Timesheet(db.Model):
     __tablename__ = "timesheets"
     id = db.Column(db.Integer, primary_key=True)
@@ -201,6 +206,10 @@ def logout():
 @login_required
 def dashboard():
     u = current_user()
+
+    # Keep Xero projects fresh automatically. If Xero is unavailable,
+    # the employee can still use the last successfully cached list.
+    maybe_sync_xero_projects()
     week = monday(request.args.get("week")).isoformat() if request.args.get("week") else monday().isoformat()
     ts = Timesheet.query.filter_by(user_id=u.id, week_start=week).first()
     if not ts:
@@ -342,9 +351,114 @@ def xero_get_active_projects():
 
     return all_items
 
+def app_setting_get(key, default=None):
+    row = db.session.get(AppSetting, key)
+    return row.value if row and row.value is not None else default
+
+def app_setting_set(key, value):
+    row = db.session.get(AppSetting, key)
+    if row is None:
+        row = AppSetting(key=key, value=str(value))
+        db.session.add(row)
+    else:
+        row.value = str(value)
+
+def _parse_utc(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+def sync_xero_projects():
+    """Fetch active Xero projects and update the local project cache."""
+    xero_projects = xero_get_active_projects()
+    seen = set()
+
+    existing_xero = Project.query.filter_by(source="xero").all()
+    existing_by_external = {p.external_id: p for p in existing_xero if p.external_id}
+
+    for item in xero_projects:
+        external_id = (item.get("projectId") or "").strip()
+        name = (item.get("name") or "").strip()
+        if not external_id or not name:
+            continue
+
+        seen.add(external_id)
+        project = existing_by_external.get(external_id)
+        if project is None:
+            project = Project(
+                external_id=external_id,
+                name=name,
+                active=True,
+                source="xero",
+            )
+            db.session.add(project)
+        else:
+            project.name = name
+            project.active = True
+            project.source = "xero"
+
+    # Only deactivate previously synced Xero projects after a successful response.
+    for project in existing_xero:
+        if project.external_id not in seen:
+            project.active = False
+
+    now = datetime.utcnow().isoformat()
+    app_setting_set("xero_projects_last_sync", now)
+    app_setting_set("xero_projects_last_attempt", now)
+    app_setting_set("xero_projects_last_error", "")
+    db.session.commit()
+    return len(seen)
+
+def maybe_sync_xero_projects(max_age_minutes=None):
+    """
+    Refresh the Xero project cache when it is stale.
+    This is deliberately fail-safe: employees keep using the last cached
+    project list if Xero is temporarily unavailable.
+    """
+    if not xero_is_configured():
+        return False
+
+    try:
+        max_age = int(
+            max_age_minutes
+            if max_age_minutes is not None
+            else os.environ.get("XERO_PROJECT_SYNC_MINUTES", "10")
+        )
+    except (TypeError, ValueError):
+        max_age = 10
+
+    now = datetime.utcnow()
+    last_sync = _parse_utc(app_setting_get("xero_projects_last_sync"))
+    if last_sync and (now - last_sync) < timedelta(minutes=max_age):
+        return False
+
+    # If the last attempt failed, do not hammer Xero on every keystroke.
+    last_attempt = _parse_utc(app_setting_get("xero_projects_last_attempt"))
+    if last_attempt and (now - last_attempt) < timedelta(minutes=2):
+        return False
+
+    try:
+        app_setting_set("xero_projects_last_attempt", now.isoformat())
+        db.session.commit()
+        sync_xero_projects()
+        return True
+    except Exception as exc:
+        db.session.rollback()
+        try:
+            app_setting_set("xero_projects_last_attempt", now.isoformat())
+            app_setting_set("xero_projects_last_error", str(exc)[:1000])
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        return False
+
 @app.get("/api/projects")
 @login_required
 def api_projects():
+    maybe_sync_xero_projects()
     q = (request.args.get("q") or "").strip()
     query = Project.query.filter(Project.active.is_(True))
     if q:
@@ -450,6 +564,8 @@ def projects_page():
         rows=rows,
         xero_configured=xero_is_configured(),
         xero_count=Project.query.filter_by(active=True, source="xero").count(),
+        xero_last_sync=app_setting_get("xero_projects_last_sync"),
+        xero_sync_minutes=os.environ.get("XERO_PROJECT_SYNC_MINUTES", "10"),
     )
 
 @app.post("/projects/sync-xero")
@@ -460,40 +576,8 @@ def projects_sync_xero():
         return redirect(url_for("projects_page"))
 
     try:
-        xero_projects = xero_get_active_projects()
-        seen = set()
-
-        # Only deactivate previously synced Xero projects after a successful API response.
-        existing_xero = Project.query.filter_by(source="xero").all()
-        existing_by_external = {p.external_id: p for p in existing_xero if p.external_id}
-
-        for item in xero_projects:
-            external_id = (item.get("projectId") or "").strip()
-            name = (item.get("name") or "").strip()
-            if not external_id or not name:
-                continue
-
-            seen.add(external_id)
-            project = existing_by_external.get(external_id)
-            if project is None:
-                project = Project(
-                    external_id=external_id,
-                    name=name,
-                    active=True,
-                    source="xero",
-                )
-                db.session.add(project)
-            else:
-                project.name = name
-                project.active = True
-                project.source = "xero"
-
-        for project in existing_xero:
-            if project.external_id not in seen:
-                project.active = False
-
-        db.session.commit()
-        flash(f"Xero sync complete: {len(seen)} active project(s) imported.", "success")
+        count = sync_xero_projects()
+        flash(f"Xero sync complete: {count} active project(s) imported.", "success")
     except Exception as exc:
         db.session.rollback()
         flash(str(exc), "error")
