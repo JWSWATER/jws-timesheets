@@ -6,13 +6,32 @@
 <div class="weekline"><input id="weekStart" type="date" value="{{ week }}"></div>
 <form id="timesheetForm" data-week="{{ week }}" data-status="{{ timesheet.status }}">
 {% for d in days %}
-<div class="card day-card" data-date="{{ d.date }}"><div class="day-head"><h3>{{ d.label }}</h3><label>Break (mins)<input class="break-input" type="number" value="{{ d.break }}"></label><div class="day-total">0.00 hrs</div></div>
+<div class="card day-card" data-date="{{ d.date }}" data-scheduled-hours="{{ d.scheduled_hours }}"><div class="day-head">
+<h3>{{ d.label }}</h3>
+<label>Break (mins)<input class="break-input" type="number" min="0" step="5" value="{{ d.break }}"></label>
+<label>Annual Leave (hrs)
+  <input class="annual-leave-input paid-hours-input" type="number" min="0" step=".25" value="{{ d.annual_leave_hours }}">
+  <small>Normal day: {{ "%.2f"|format(d.scheduled_hours) }} hrs</small>
+</label>
+<label class="public-holiday-wrap">Public Holiday
+  <span class="ph-control">
+    <input class="public-holiday-input" type="checkbox" {% if d.public_holiday %}checked{% endif %}>
+    Full day ({{ "%.2f"|format(d.scheduled_hours) }} hrs)
+  </span>
+</label>
+<div class="day-total">0.00 hrs</div></div>
 <div class="entries"><div class="entry-head"><span>Start</span><span>Finish</span><span>Project</span><span>Description</span><span></span></div><div class="entry-list">
 {% for e in d.entries %}<div class="entry-row"><input type="time" class="start" value="{{ e.start_time if e else '' }}"><input type="time" class="finish" value="{{ e.finish_time if e else '' }}">
 <div class="project-wrap"><input class="project-search" data-project-id="{{ e.project_id if e else '' }}" value="{{ e.project.name if e and e.project else '' }}" placeholder="Type project name or ref"><div class="project-suggestions hidden"></div></div>
 <input class="description" value="{{ e.description if e else '' }}" placeholder="Description"><button type="button" class="delete-row">🗑</button></div>{% endfor %}
 </div><button type="button" class="add-row">＋ Add another</button></div></div>{% endfor %}
-<div class="card week-summary"><div><span>Week total</span><strong id="weekTotal">0.00 hrs</strong></div><div class="actions"><button type="button" id="saveDraft" class="btn secondary">Save Draft</button><button type="button" id="submitTimesheet" class="btn primary">Submit Timesheet</button></div></div>
+<div class="card week-summary">
+<div class="week-totals">
+  <div><span>Worked</span><strong id="workedTotal">0.00 hrs</strong></div>
+  <div><span>Annual Leave</span><strong id="annualLeaveTotal">0.00 hrs</strong></div>
+  <div><span>Public Holiday</span><strong id="publicHolidayTotal">0.00 hrs</strong></div>
+  <div><span>Paid Total</span><strong id="weekTotal">0.00 hrs</strong></div>
+</div><div class="actions"><button type="button" id="saveDraft" class="btn secondary">Save Draft</button><button type="button" id="submitTimesheet" class="btn primary">Submit Timesheet</button></div></div>
 </form>
 <script>window.TIMESHEET_LOCKED={{ 'true' if timesheet.status in ['submitted','approved'] else 'false' }};</script>
 </section></main></div>{% endblock %}

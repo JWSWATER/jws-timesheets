@@ -31,7 +31,9 @@
           <input name="name" placeholder="Employee name" required>
           <input name="username" placeholder="Username" required>
           <input name="password" type="password" placeholder="Temporary password" required>
-          <input name="normal_hours" type="number" step=".25" value="40" placeholder="Normal hours">
+          <input name="normal_hours" type="number" step=".25" value="40" placeholder="Normal weekly hours">
+<input name="mon_thu_hours" type="number" step=".25" min="0" value="8.5" placeholder="Mon–Thu normal hours">
+<input name="friday_hours" type="number" step=".25" min="0" value="6" placeholder="Friday normal hours">
           <input name="basic_rate" type="number" step=".01" placeholder="Basic rate">
           <input name="ot1_start" type="number" step=".25" value="40" placeholder="OT1 starts after">
           <input name="ot1_rate" type="number" step=".01" placeholder="OT1 rate">
@@ -42,12 +44,14 @@
       </div>
       <div class="card panel">
         <table>
-          <tr><th>Name</th><th>Username</th><th>Normal</th><th>OT1</th><th>OT2</th><th>Status</th><th></th></tr>
+          <tr><th>Name</th><th>Username</th><th>Normal</th><th>Mon–Thu</th><th>Friday</th><th>OT1</th><th>OT2</th><th>Status</th><th></th></tr>
           {% for r in rows %}
           <tr>
             <td>{{r.name}}</td>
             <td>{{r.username}}</td>
             <td>{{r.normal_hours}}</td>
+            <td>{{ "%.2f"|format(r.mon_thu_hours or 8.5) }} hrs</td>
+            <td>{{ "%.2f"|format(r.friday_hours or 6) }} hrs</td>
             <td>{{r.ot1_start}} / £{{r.ot1_rate}}</td>
             <td>{{r.ot2_start or "—"}} / £{{r.ot2_rate}}</td>
             <td>{{"Active" if r.active else "Disabled"}}</td>

@@ -50,6 +50,9 @@ class User(db.Model):
     ot1_rate = db.Column(db.Float, nullable=False, default=0)
     ot2_start = db.Column(db.Float, nullable=True)
     ot2_rate = db.Column(db.Float, nullable=False, default=0)
+    standard_day_hours = db.Column(db.Float, nullable=False, default=8)
+    mon_thu_hours = db.Column(db.Float, nullable=False, default=8.5)
+    friday_hours = db.Column(db.Float, nullable=False, default=6)
 
 class Project(db.Model):
     __tablename__ = "projects"
@@ -87,6 +90,15 @@ class Entry(db.Model):
     description = db.Column(db.String(1000), nullable=True)
     project = db.relationship("Project")
 
+class DayPaidHours(db.Model):
+    __tablename__ = "day_paid_hours"
+    id = db.Column(db.Integer, primary_key=True)
+    timesheet_id = db.Column(db.Integer, db.ForeignKey("timesheets.id"), nullable=False, index=True)
+    work_date = db.Column(db.String(10), nullable=False)
+    annual_leave_hours = db.Column(db.Float, nullable=False, default=0)
+    public_holiday_hours = db.Column(db.Float, nullable=False, default=0)
+    __table_args__ = (db.UniqueConstraint("timesheet_id", "work_date", name="uq_day_paid_hours"),)
+
 class Break(db.Model):
     __tablename__ = "breaks"
     id = db.Column(db.Integer, primary_key=True)
@@ -97,6 +109,28 @@ class Break(db.Model):
 
 def init_db():
     db.create_all()
+
+    # Add standard paid day hours to existing databases.
+    try:
+        inspector = db.inspect(db.engine)
+        user_columns = {c["name"] for c in inspector.get_columns("users")}
+        if "standard_day_hours" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN standard_day_hours FLOAT NOT NULL DEFAULT 8"
+                )
+        if "mon_thu_hours" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN mon_thu_hours FLOAT NOT NULL DEFAULT 8.5"
+                )
+        if "friday_hours" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN friday_hours FLOAT NOT NULL DEFAULT 6"
+                )
+    except Exception:
+        db.session.rollback()
 
     if User.query.count() == 0:
         # Railway/live deployments require an administrator password to be supplied securely.
@@ -168,12 +202,39 @@ def hhmm_hours(start, finish):
         mins += 1440
     return mins / 60
 
-def timesheet_total(tsid):
+def scheduled_hours_for_date(user, work_date):
+    """Normal paid hours for this employee on the supplied YYYY-MM-DD date."""
+    try:
+        weekday = datetime.strptime(work_date, "%Y-%m-%d").weekday()
+    except (TypeError, ValueError):
+        return 0.0
+
+    # Monday=0 ... Thursday=3, Friday=4, weekend=5/6.
+    if weekday <= 3:
+        return float(user.mon_thu_hours or 8.5)
+    if weekday == 4:
+        return float(user.friday_hours or 6)
+    return 0.0
+
+def timesheet_worked_total(tsid):
     breaks = {r.work_date: r.minutes for r in Break.query.filter_by(timesheet_id=tsid).all()}
     totals = {}
     for r in Entry.query.filter_by(timesheet_id=tsid).all():
         totals[r.work_date] = totals.get(r.work_date, 0) + hhmm_hours(r.start_time, r.finish_time)
     return sum(max(0, v - breaks.get(k, 0) / 60) for k, v in totals.items())
+
+def timesheet_paid_hours_totals(tsid):
+    annual_leave = 0.0
+    public_holiday = 0.0
+    for row in DayPaidHours.query.filter_by(timesheet_id=tsid).all():
+        annual_leave += float(row.annual_leave_hours or 0)
+        public_holiday += float(row.public_holiday_hours or 0)
+    return annual_leave, public_holiday
+
+def timesheet_total(tsid):
+    worked = timesheet_worked_total(tsid)
+    annual_leave, public_holiday = timesheet_paid_hours_totals(tsid)
+    return worked + annual_leave + public_holiday
 
 @app.get("/health")
 @csrf.exempt
@@ -220,6 +281,8 @@ def dashboard():
     entries = Entry.query.filter_by(timesheet_id=ts.id).order_by(Entry.work_date, Entry.id).all()
     break_rows = Break.query.filter_by(timesheet_id=ts.id).all()
     break_map = {r.work_date: r.minutes for r in break_rows}
+    paid_rows = DayPaidHours.query.filter_by(timesheet_id=ts.id).all()
+    paid_map = {r.work_date: r for r in paid_rows}
 
     days = []
     start = date.fromisoformat(week)
@@ -228,11 +291,16 @@ def dashboard():
         day_entries = [e for e in entries if e.work_date == work_date]
         if not day_entries:
             day_entries = [None]
+        paid = paid_map.get(work_date)
         days.append({
             "date": work_date,
             "label": (start + timedelta(days=i)).strftime("%A %d %B %Y"),
             "entries": day_entries,
-            "break": break_map.get(work_date, 0)
+            "break": break_map.get(work_date, 0),
+            "annual_leave_hours": float(paid.annual_leave_hours or 0) if paid else 0,
+            "public_holiday": bool(paid and float(paid.public_holiday_hours or 0) > 0),
+            "public_holiday_hours": float(paid.public_holiday_hours or 0) if paid else 0,
+            "scheduled_hours": scheduled_hours_for_date(u, work_date),
         })
     return render_template("dashboard.html", user=u, timesheet=ts, week=week, days=days)
 
@@ -253,11 +321,21 @@ def save_timesheet():
 
     Entry.query.filter_by(timesheet_id=ts.id).delete()
     Break.query.filter_by(timesheet_id=ts.id).delete()
+    DayPaidHours.query.filter_by(timesheet_id=ts.id).delete()
 
     for day in data["days"]:
         db.session.add(Break(
             timesheet_id=ts.id, work_date=day["date"],
             minutes=int(day.get("breakMinutes") or 0)
+        ))
+        annual_leave_hours = max(0.0, float(day.get("annualLeaveHours") or 0))
+        is_public_holiday = bool(day.get("publicHoliday"))
+        public_holiday_hours = scheduled_hours_for_date(u, day["date"]) if is_public_holiday else 0.0
+        db.session.add(DayPaidHours(
+            timesheet_id=ts.id,
+            work_date=day["date"],
+            annual_leave_hours=annual_leave_hours,
+            public_holiday_hours=public_holiday_hours,
         ))
         for e in day["entries"]:
             if any([e.get("start"), e.get("finish"), e.get("projectId"), e.get("description")]):
@@ -494,15 +572,23 @@ def timesheet_summary(tsid):
         return "Not found", 404
     entries = Entry.query.filter_by(timesheet_id=tsid).order_by(Entry.work_date, Entry.id).all()
     break_map = {r.work_date: r.minutes for r in Break.query.filter_by(timesheet_id=tsid).all()}
-    total = timesheet_total(tsid)
+    paid_rows = DayPaidHours.query.filter_by(timesheet_id=tsid).order_by(DayPaidHours.work_date).all()
+    worked_total = timesheet_worked_total(tsid)
+    annual_leave_total, public_holiday_total = timesheet_paid_hours_totals(tsid)
+    total = worked_total + annual_leave_total + public_holiday_total
     employee = ts.user
-    normal = min(total, employee.normal_hours)
+
+    # Overtime is calculated from hours actually worked, not paid leave/public holidays.
+    normal = min(worked_total, employee.normal_hours)
     ot2_start = employee.ot2_start
-    ot1 = max(0, min(total, ot2_start if ot2_start else total) - employee.ot1_start)
-    ot2 = max(0, total - ot2_start) if ot2_start else 0
+    ot1 = max(0, min(worked_total, ot2_start if ot2_start else worked_total) - employee.ot1_start)
+    ot2 = max(0, worked_total - ot2_start) if ot2_start else 0
     return render_template(
         "summary.html", user=u, ts=ts, employee=employee, entries=entries,
-        breaks=break_map, total=total, normal=normal, ot1=ot1, ot2=ot2
+        breaks=break_map, paid_rows=paid_rows,
+        worked_total=worked_total, annual_leave_total=annual_leave_total,
+        public_holiday_total=public_holiday_total,
+        total=total, normal=normal, ot1=ot1, ot2=ot2
     )
 
 @app.post("/timesheet/<int:tsid>/<action>")
@@ -539,6 +625,9 @@ def employees():
                 ot1_rate=float(f.get("ot1_rate") or 0),
                 ot2_start=float(f["ot2_start"]) if f.get("ot2_start") else None,
                 ot2_rate=float(f.get("ot2_rate") or 0),
+                standard_day_hours=8,
+                mon_thu_hours=float(f.get("mon_thu_hours") or 8.5),
+                friday_hours=float(f.get("friday_hours") or 6),
             ))
             db.session.commit()
             return redirect(url_for("employees"))

@@ -4,5 +4,30 @@
 <h1>Full Timesheet Summary</h1><p><b>{{ employee.name }}</b> · Week {{ ts.week_start }}</p><div class="card panel">
 <table><tr><th>Date</th><th>Start</th><th>Finish</th><th>Project</th><th>Description</th></tr>
 {% for e in entries %}<tr><td>{{ e.work_date }}</td><td>{{ e.start_time }}</td><td>{{ e.finish_time }}</td><td>{{ e.project.name if e.project else "" }}</td><td>{{ e.description }}</td></tr>{% endfor %}</table>
-<p><b>Total:</b> {{"%.2f"|format(total)}} hrs · <b>Normal:</b> {{"%.2f"|format(normal)}} · <b>OT1:</b> {{"%.2f"|format(ot1)}} · <b>OT2:</b> {{"%.2f"|format(ot2)}}</p></div>
+{% if paid_rows %}
+<h3 style="margin-top:22px">Annual Leave & Public Holidays</h3>
+<table>
+<tr><th>Date</th><th>Annual Leave</th><th>Public Holiday</th></tr>
+{% for r in paid_rows %}
+  {% if r.annual_leave_hours or r.public_holiday_hours %}
+  <tr>
+    <td>{{ r.work_date }}</td>
+    <td>{{ "%.2f"|format(r.annual_leave_hours) }} hrs</td>
+    <td>{{ "%.2f"|format(r.public_holiday_hours) }} hrs</td>
+  </tr>
+  {% endif %}
+{% endfor %}
+</table>
+{% endif %}
+<p>
+<b>Worked:</b> {{"%.2f"|format(worked_total)}} hrs ·
+<b>Annual Leave:</b> {{"%.2f"|format(annual_leave_total)}} hrs ·
+<b>Public Holiday:</b> {{"%.2f"|format(public_holiday_total)}} hrs ·
+<b>Paid Total:</b> {{"%.2f"|format(total)}} hrs
+</p>
+<p>
+<b>Normal Worked:</b> {{"%.2f"|format(normal)}} hrs ·
+<b>OT1:</b> {{"%.2f"|format(ot1)}} hrs ·
+<b>OT2:</b> {{"%.2f"|format(ot2)}} hrs
+</p></div>
 </section></main></div>{% endblock %}
