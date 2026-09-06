@@ -328,9 +328,16 @@ def save_timesheet():
             timesheet_id=ts.id, work_date=day["date"],
             minutes=int(day.get("breakMinutes") or 0)
         ))
-        annual_leave_hours = max(0.0, float(day.get("annualLeaveHours") or 0))
-        is_public_holiday = bool(day.get("publicHoliday"))
-        public_holiday_hours = scheduled_hours_for_date(u, day["date"]) if is_public_holiday else 0.0
+        scheduled_hours = scheduled_hours_for_date(u, day["date"])
+        is_working_weekday = scheduled_hours > 0
+
+        # Leave/public-holiday options apply Monday-Friday only.
+        annual_leave_hours = (
+            max(0.0, float(day.get("annualLeaveHours") or 0))
+            if is_working_weekday else 0.0
+        )
+        is_public_holiday = bool(day.get("publicHoliday")) if is_working_weekday else False
+        public_holiday_hours = scheduled_hours if is_public_holiday else 0.0
         db.session.add(DayPaidHours(
             timesheet_id=ts.id,
             work_date=day["date"],

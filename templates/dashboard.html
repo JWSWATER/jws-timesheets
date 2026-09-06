@@ -9,16 +9,16 @@
 <div class="card day-card" data-date="{{ d.date }}" data-scheduled-hours="{{ d.scheduled_hours }}"><div class="day-head">
 <h3>{{ d.label }}</h3>
 <label>Break (mins)<input class="break-input" type="number" min="0" step="5" value="{{ d.break }}"></label>
+{% if d.scheduled_hours > 0 %}
 <label>Annual Leave (hrs)
   <input class="annual-leave-input paid-hours-input" type="number" min="0" step=".25" value="{{ d.annual_leave_hours }}">
   <small>Normal day: {{ "%.2f"|format(d.scheduled_hours) }} hrs</small>
 </label>
-<label class="public-holiday-wrap">Public Holiday
-  <span class="ph-control">
-    <input class="public-holiday-input" type="checkbox" {% if d.public_holiday %}checked{% endif %}>
-    Full day ({{ "%.2f"|format(d.scheduled_hours) }} hrs)
-  </span>
+<label class="public-holiday-wrap ph-control">
+  <span>Public Holiday?</span>
+  <input class="public-holiday-input" type="checkbox" {% if d.public_holiday %}checked{% endif %}>
 </label>
+{% endif %}
 <div class="day-total">0.00 hrs</div></div>
 <div class="entries"><div class="entry-head"><span>Start</span><span>Finish</span><span>Project</span><span>Description</span><span></span></div><div class="entry-list">
 {% for e in d.entries %}<div class="entry-row"><input type="time" class="start" value="{{ e.start_time if e else '' }}"><input type="time" class="finish" value="{{ e.finish_time if e else '' }}">
