@@ -23,3 +23,10 @@
 .public-holiday-wrap{min-width:155px}
 
 .day-head label small{display:block;margin-top:3px;font-size:10px;font-weight:500;color:var(--muted)}
+
+/* Change password */
+.password-panel{max-width:560px}
+.password-form{display:grid;gap:14px;margin-top:18px}
+.password-form label{font-size:13px;font-weight:700;color:var(--muted)}
+.password-form input{display:block;width:100%;margin-top:6px;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+.password-form .btn{min-width:170px}

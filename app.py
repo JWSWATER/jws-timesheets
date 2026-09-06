@@ -680,6 +680,36 @@ def projects_sync_xero():
 
     return redirect(url_for("projects_page"))
 
+
+@app.route("/change-password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    u = current_user()
+
+    if request.method == "POST":
+        current_password = request.form.get("current_password", "")
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if not check_password_hash(u.password_hash, current_password):
+            flash("Your current password is incorrect.", "error")
+        elif len(new_password) < 8:
+            flash("Your new password must be at least 8 characters.", "error")
+        elif new_password != confirm_password:
+            flash("The new passwords do not match.", "error")
+        elif check_password_hash(u.password_hash, new_password):
+            flash("Your new password must be different from your current password.", "error")
+        else:
+            u.password_hash = generate_password_hash(new_password)
+            db.session.commit()
+
+            # Require a fresh login after changing the password on this device.
+            session.clear()
+            flash("Password changed successfully. Please sign in with your new password.", "success")
+            return redirect(url_for("login"))
+
+    return render_template("change_password.html", user=u)
+
 @app.get("/settings")
 @manager_required
 def settings():
