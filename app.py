@@ -2597,6 +2597,43 @@ def _xero_missing(exc):
     return "(404)" in str(exc)
 
 
+def _xero_project_time_entry_exists(project_id, time_entry_id, token=None):
+    """Return True only if the linked Xero Projects time entry still exists.
+
+    Xero Projects commonly returns HTTP 400 (validation exception), rather than
+    404, when a time-entry ID has already been deleted.  To avoid treating that
+    ambiguous 400 as a hard failure, enumerate the project's current time
+    entries and match the exact ID before attempting DELETE.
+    """
+    token = token or xero_access_token()
+    wanted = (time_entry_id or "").strip().casefold()
+    if not wanted:
+        return False
+
+    page = 1
+    while True:
+        payload = xero_api_request(
+            "GET",
+            f"/Projects/{project_id}/Time",
+            token=token,
+            query={"page": page, "pageSize": 500},
+        ) or {}
+        items = payload.get("items") or []
+        for item in items:
+            current_id = (item.get("timeEntryId") or item.get("TimeEntryID") or "").strip().casefold()
+            if current_id == wanted:
+                return True
+
+        pagination = payload.get("pagination") or {}
+        try:
+            page_count = int(pagination.get("pageCount") or 1)
+        except (TypeError, ValueError):
+            page_count = 1
+        if page >= page_count or not items:
+            return False
+        page += 1
+
+
 def _delete_jws_timesheet_rows(ts):
     """Delete one local JWS timesheet and its child rows."""
     tsid = ts.id
@@ -2720,14 +2757,24 @@ def delete_timesheet_from_xero_and_jws(ts):
                 f"Cannot remove Xero Projects time entry for {entry.work_date}: the local Project ID is missing."
             )
         try:
-            xero_api_request(
-                "DELETE", f"/Projects/{project_id}/Time/{time_entry_id}", token=token
-            )
+            still_exists = _xero_project_time_entry_exists(project_id, time_entry_id, token=token)
         except RuntimeError as exc:
-            if not _xero_missing(exc):
+            raise RuntimeError(
+                f"Could not verify Xero Projects time entry for {entry.work_date}: {exc}"
+            ) from exc
+
+        if still_exists:
+            try:
+                xero_api_request(
+                    "DELETE", f"/Projects/{project_id}/Time/{time_entry_id}", token=token
+                )
+            except RuntimeError as exc:
                 raise RuntimeError(
                     f"Could not remove Xero Projects time entry for {entry.work_date}: {exc}"
                 ) from exc
+
+        # If it no longer exists in Xero (for example because the Primary Admin
+        # already deleted it manually), clear the stale local link and continue.
         entry.xero_time_entry_id = None
         entry.xero_exported_at = None
         db.session.commit()
