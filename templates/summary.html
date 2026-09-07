@@ -4,10 +4,24 @@
 <h1>Full Timesheet Summary</h1>
 <p><b>{{ employee.name }}</b> · Week {{ ts.week_start }} · Status: <b>{{ ts.status|title }}</b></p>
 {% if ts.amended_at %}<p class="muted">Last amended {{ ts.amended_at.strftime('%d %b %Y %H:%M') }}{% if amended_by %} by {{ amended_by.name }}{% endif %}.</p>{% endif %}
-{% if user.is_primary_admin and ts.status == "submitted" %}
-<div class="actions" style="margin:14px 0 18px">
+{% if user.is_primary_admin %}
+<div class="actions" style="margin:14px 0 8px">
+  {% if ts.status == "submitted" %}
   <a class="btn secondary" href="/timesheet/{{ ts.id }}/amend">Amend Submitted Timesheet</a>
+  {% endif %}
+  {% if not has_xero_links %}
+  <form method="post" action="/timesheet/{{ ts.id }}/delete" class="inline" onsubmit="return confirm('Permanently delete this JWS timesheet? This cannot be undone.');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn danger" type="submit">Delete Timesheet</button>
+  </form>
+  {% else %}
+  <form method="post" action="/timesheet/{{ ts.id }}/delete-xero-and-jws" class="inline" onsubmit="return confirm('DELETE TEST TIMESHEET? This will remove this week from Xero Payroll, Xero Projects time entries, any JWS-created Xero Holiday leave, and JWS itself. This cannot be undone.');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn danger" type="submit">Delete from Xero &amp; JWS</button>
+  </form>
+  {% endif %}
 </div>
+{% if has_xero_links %}<p class="muted">Primary Admin only: linked Xero records can be removed before deleting this JWS timesheet. Completed payroll is always protected. Xero Project tasks are retained because they may be reused.</p>{% endif %}
 {% endif %}
 <div class="card panel">
 <table><tr><th>Date</th><th>Start</th><th>Finish</th><th>Project</th><th>Description / Xero Task</th><th>Xero</th></tr>
@@ -46,6 +60,7 @@
 <b>OT1:</b> {{"%.2f"|format(ot1)}} hrs ·
 <b>OT2:</b> {{"%.2f"|format(ot2)}} hrs
 </p>
+<p class="muted">Annual Leave and Public Holiday hours count towards the weekly overtime threshold; only actual worked hours are paid at overtime rates.</p>
 {% else %}
 <p class="muted"><b>Payroll basis: Salaried.</b> Worked hours are retained for accountability and Xero Projects only; they do not change salary.</p>
 {% endif %}

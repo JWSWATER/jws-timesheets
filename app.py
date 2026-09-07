@@ -1432,25 +1432,41 @@ def payroll_daily_worked_hours(tsid):
     return result
 
 
-def worked_band_totals(employee, worked_total):
-    worked_total = float(worked_total or 0)
-    normal = min(worked_total, float(employee.normal_hours or 0))
+def worked_band_totals(employee, worked_total, paid_nonwork_total=0):
+    """Split actual worked hours into Normal / OT1 / OT2.
+
+    Annual Leave and standard Public Holiday hours count towards the employee's
+    weekly overtime threshold, but they are never themselves paid as overtime.
+    Only actual worked hours are moved into OT bands.
+
+    Example: 24 worked + 8.5 leave + 8.5 public holiday = 41 paid hours.
+    With OT1 starting after 40 hours, the worked split is 23 Normal + 1 OT1.
+    """
+    worked_total = max(0.0, float(worked_total or 0))
+    paid_nonwork_total = max(0.0, float(paid_nonwork_total or 0))
+    qualifying_total = worked_total + paid_nonwork_total
+
+    ot1_start = float(employee.ot1_start if employee.ot1_start is not None else (employee.normal_hours or 0))
     ot2_start = float(employee.ot2_start) if employee.ot2_start is not None else None
-    ot1_start = float(employee.ot1_start or 0)
-    ot1 = max(0.0, min(worked_total, ot2_start if ot2_start is not None else worked_total) - ot1_start)
-    ot2 = max(0.0, worked_total - ot2_start) if ot2_start is not None else 0.0
-    accounted = normal + ot1 + ot2
-    if abs(accounted - worked_total) > 0.02:
-        raise RuntimeError(
-            "Employee Normal Hours and overtime thresholds leave an unallocated gap. "
-            "Normal weekly hours should align with the OT1 start threshold."
-        )
+
+    # How many of the ACTUAL worked hours sit beyond the weekly paid-hours
+    # thresholds? Paid leave/holidays consume threshold capacity but cannot
+    # themselves become overtime hours.
+    overtime_worked = min(worked_total, max(0.0, qualifying_total - ot1_start))
+    ot2 = (
+        min(worked_total, max(0.0, qualifying_total - ot2_start))
+        if ot2_start is not None else 0.0
+    )
+    ot2 = min(ot2, overtime_worked)
+    ot1 = max(0.0, overtime_worked - ot2)
+    normal = max(0.0, worked_total - ot1 - ot2)
+
     return round(normal, 4), round(ot1, 4), round(ot2, 4)
 
 
-def allocate_payroll_lines(employee, daily_hours, normal_item, ot1_item, ot2_item=None):
+def allocate_payroll_lines(employee, daily_hours, normal_item, ot1_item, ot2_item=None, paid_nonwork_total=0):
     total = round(sum(daily_hours.values()), 4)
-    normal_left, ot1_left, ot2_left = worked_band_totals(employee, total)
+    normal_left, ot1_left, ot2_left = worked_band_totals(employee, total, paid_nonwork_total)
     lines = []
     for work_date in sorted(daily_hours):
         remaining = daily_hours[work_date]
@@ -1646,15 +1662,20 @@ def export_timesheet_to_xero_payroll(ts):
     daily_hours = payroll_daily_worked_hours(ts.id)
     total_worked = round(sum(daily_hours.values()), 4)
 
+    paid_rows = DayPaidHours.query.filter_by(timesheet_id=ts.id).all()
+    paid_nonwork_total = round(sum(
+        float(r.annual_leave_hours or 0) + float(r.public_holiday_hours or 0)
+        for r in paid_rows
+    ), 4)
+
     if basis == "hourly":
-        _, _, ot2_total = worked_band_totals(employee, total_worked)
+        _, _, ot2_total = worked_band_totals(employee, total_worked, paid_nonwork_total)
         profile = xero_payroll_preflight(
             employee, token=token, require_ot2=ot2_total > 0.0001, as_of_date=ts.week_start
         )
     else:
         profile = xero_payroll_base_preflight(employee, token=token)
 
-    paid_rows = DayPaidHours.query.filter_by(timesheet_id=ts.id).all()
     public_holiday_dates = {
         r.work_date for r in paid_rows if float(r.public_holiday_hours or 0) > 0
     }
@@ -1694,6 +1715,7 @@ def export_timesheet_to_xero_payroll(ts):
             profile["normal_item"],
             profile["ot1_item"],
             profile.get("ot2_item"),
+            paid_nonwork_total=paid_nonwork_total,
         )
         start_date = ts.week_start
         end_date = (date.fromisoformat(ts.week_start) + timedelta(days=6)).isoformat()
@@ -2501,11 +2523,11 @@ def timesheet_summary(tsid):
     total = worked_total + annual_leave_total + public_holiday_total
     employee = ts.user
 
-    # Overtime is calculated from hours actually worked, not paid leave/public holidays.
-    normal = min(worked_total, employee.normal_hours)
-    ot2_start = employee.ot2_start
-    ot1 = max(0, min(worked_total, ot2_start if ot2_start else worked_total) - employee.ot1_start)
-    ot2 = max(0, worked_total - ot2_start) if ot2_start else 0
+    # Leave and standard Public Holiday hours count towards the weekly OT
+    # threshold, while only actual worked hours can be paid at an OT rate.
+    normal, ot1, ot2 = worked_band_totals(
+        employee, worked_total, annual_leave_total + public_holiday_total
+    )
     project_entries = [e for e in entries if e.project and e.project.source == "xero"]
     xero_sent_count = sum(1 for e in project_entries if e.xero_time_entry_id)
     amended_by = db.session.get(User, ts.amended_by_user_id) if ts.amended_by_user_id else None
@@ -2525,7 +2547,228 @@ def timesheet_summary(tsid):
         payroll_approved=bool(ts.xero_payroll_approved_at),
         payroll_basis=payroll_basis_for(employee),
         amended_by=amended_by,
+        has_xero_links=bool(
+            ts.xero_payroll_timesheet_id
+            or any(e.xero_time_entry_id for e in entries)
+            or any(r.xero_leave_id for r in paid_rows)
+        ),
     )
+
+@app.post("/timesheet/<int:tsid>/delete")
+@primary_admin_required
+def delete_timesheet(tsid):
+    """Permanently delete a JWS timesheet that has not been sent to Xero.
+
+    Xero-linked records are deliberately protected so a local delete cannot
+    silently orphan Projects, Payroll or Leave records in Xero.
+    """
+    ts = db.session.get(Timesheet, tsid)
+    if not ts:
+        return "Not found", 404
+
+    entries = Entry.query.filter_by(timesheet_id=tsid).all()
+    paid_rows = DayPaidHours.query.filter_by(timesheet_id=tsid).all()
+    has_xero_links = bool(
+        ts.xero_payroll_timesheet_id
+        or any(e.xero_time_entry_id for e in entries)
+        or any(r.xero_leave_id for r in paid_rows)
+    )
+    if has_xero_links:
+        flash(
+            "This timesheet has records linked to Xero, so JWS has protected it from deletion. "
+            "Deleting it here would not remove the corresponding Xero records.",
+            "error",
+        )
+        return redirect(url_for("timesheet_summary", tsid=tsid))
+
+    employee_name = ts.user.name
+    week_start = ts.week_start
+    Break.query.filter_by(timesheet_id=tsid).delete(synchronize_session=False)
+    DayPaidHours.query.filter_by(timesheet_id=tsid).delete(synchronize_session=False)
+    Entry.query.filter_by(timesheet_id=tsid).delete(synchronize_session=False)
+    db.session.delete(ts)
+    db.session.commit()
+    flash(f"Deleted {employee_name}'s timesheet for week {week_start}.", "success")
+    return redirect(url_for("management"))
+
+
+def _xero_missing(exc):
+    """True when a Xero record has already been deleted externally."""
+    return "(404)" in str(exc)
+
+
+def _delete_jws_timesheet_rows(ts):
+    """Delete one local JWS timesheet and its child rows."""
+    tsid = ts.id
+    Break.query.filter_by(timesheet_id=tsid).delete(synchronize_session=False)
+    DayPaidHours.query.filter_by(timesheet_id=tsid).delete(synchronize_session=False)
+    Entry.query.filter_by(timesheet_id=tsid).delete(synchronize_session=False)
+    db.session.delete(ts)
+    db.session.commit()
+
+
+def delete_timesheet_from_xero_and_jws(ts):
+    """Remove a test timesheet from Xero and then from JWS.
+
+    This is intentionally restricted to the Primary Admin route below.  It
+    removes only records created/linked by this JWS timesheet:
+      * Xero UK Payroll timesheet (Approved is first reverted to Draft),
+      * Xero employee Holiday leave records created by JWS,
+      * Xero Projects time entries.
+
+    Xero Project tasks are deliberately retained because tasks can be reused by
+    other time entries and deleting a task could affect unrelated project data.
+    A Completed Payroll timesheet is never deleted because it has already been
+    included in a posted pay run.
+    """
+    if not xero_is_configured():
+        raise RuntimeError("Xero is not configured in Railway.")
+
+    token = xero_access_token()
+    employee_name = ts.user.name
+    week_start = ts.week_start
+    entries = Entry.query.filter_by(timesheet_id=ts.id).order_by(Entry.id).all()
+    paid_rows = DayPaidHours.query.filter_by(timesheet_id=ts.id).order_by(DayPaidHours.id).all()
+
+    # Pre-flight the Payroll record before deleting anything else.  Completed
+    # payroll is historical payroll and must never be removed automatically.
+    payroll_detail = None
+    if ts.xero_payroll_timesheet_id:
+        try:
+            payload = xero_payroll_request(
+                "GET", f"/Timesheets/{ts.xero_payroll_timesheet_id}", token=token
+            ) or {}
+            payroll_detail = payload.get("timesheet") or {}
+        except RuntimeError as exc:
+            if not _xero_missing(exc):
+                raise
+        if payroll_detail:
+            status = (payroll_detail.get("status") or "").strip().casefold()
+            if status == "completed":
+                raise RuntimeError(
+                    "The linked Xero Payroll timesheet is Completed in a pay run, so it cannot be removed by JWS. "
+                    "The bookkeeper must correct the payroll in Xero instead."
+                )
+
+    # Remove JWS-created Holiday leave first.  If Xero has locked a leave
+    # record because of payroll processing, stop here before deleting Projects
+    # or the Payroll timesheet.
+    leave_rows = [r for r in paid_rows if r.xero_leave_id]
+    if leave_rows:
+        employee_id = (ts.user.xero_payroll_employee_id or "").strip()
+        if not employee_id:
+            resolved = xero_resolve_payroll_employee(ts.user, token=token)
+            employee_id = (resolved.get("employeeID") or "").strip()
+        if not employee_id:
+            raise RuntimeError("Could not resolve the Xero Payroll employee required to remove Holiday leave.")
+
+        for row in leave_rows:
+            leave_id = (row.xero_leave_id or "").strip()
+            if not leave_id:
+                continue
+            try:
+                xero_payroll_request(
+                    "DELETE", f"/Employees/{employee_id}/Leave/{leave_id}", token=token
+                )
+            except RuntimeError as exc:
+                if not _xero_missing(exc):
+                    raise RuntimeError(
+                        f"Could not remove Xero Holiday leave for {row.work_date}: {exc}"
+                    ) from exc
+            row.xero_leave_id = None
+            row.xero_leave_exported_at = None
+            db.session.commit()
+
+    # Remove the Payroll timesheet.  Approved timesheets must first return to
+    # Draft.  A record already deleted manually in Xero is treated as cleared.
+    if ts.xero_payroll_timesheet_id:
+        xero_timesheet_id = ts.xero_payroll_timesheet_id
+        status = ((payroll_detail or {}).get("status") or "").strip().casefold()
+        if status == "approved":
+            try:
+                xero_payroll_request(
+                    "POST", f"/Timesheets/{xero_timesheet_id}/RevertToDraft", token=token,
+                    idempotency_key=_xero_idempotency(
+                        "payroll-revert-delete-v1", f"timesheet-{ts.id}|{xero_timesheet_id}"
+                    ),
+                )
+            except RuntimeError as exc:
+                if not _xero_missing(exc):
+                    raise RuntimeError(f"Could not revert the Xero Payroll timesheet to Draft: {exc}") from exc
+
+        try:
+            xero_payroll_request("DELETE", f"/Timesheets/{xero_timesheet_id}", token=token)
+        except RuntimeError as exc:
+            if not _xero_missing(exc):
+                raise RuntimeError(f"Could not delete the Xero Payroll timesheet: {exc}") from exc
+
+        ts.xero_payroll_timesheet_id = None
+        ts.xero_payroll_exported_at = None
+        ts.xero_payroll_approved_at = None
+        ts.xero_payroll_export_error = None
+        db.session.commit()
+
+    # Remove every linked Projects time entry.  Project tasks are deliberately
+    # retained in Xero; they are harmless and may already be shared/reused.
+    for entry in entries:
+        time_entry_id = (entry.xero_time_entry_id or "").strip()
+        if not time_entry_id:
+            continue
+        project_id = ((entry.project.external_id if entry.project else None) or "").strip()
+        if not project_id:
+            raise RuntimeError(
+                f"Cannot remove Xero Projects time entry for {entry.work_date}: the local Project ID is missing."
+            )
+        try:
+            xero_api_request(
+                "DELETE", f"/Projects/{project_id}/Time/{time_entry_id}", token=token
+            )
+        except RuntimeError as exc:
+            if not _xero_missing(exc):
+                raise RuntimeError(
+                    f"Could not remove Xero Projects time entry for {entry.work_date}: {exc}"
+                ) from exc
+        entry.xero_time_entry_id = None
+        entry.xero_exported_at = None
+        db.session.commit()
+
+    ts.xero_projects_exported_at = None
+    ts.xero_projects_export_error = None
+    db.session.commit()
+
+    # Only after all linked external records have been removed do we delete the
+    # local week.  The employee can then create and submit the same week again.
+    _delete_jws_timesheet_rows(ts)
+    return employee_name, week_start
+
+
+@app.post("/timesheet/<int:tsid>/delete-xero-and-jws")
+@primary_admin_required
+def delete_xero_and_jws_timesheet(tsid):
+    ts = db.session.get(Timesheet, tsid)
+    if not ts:
+        return "Not found", 404
+
+    try:
+        employee_name, week_start = delete_timesheet_from_xero_and_jws(ts)
+        flash(
+            f"Deleted the test timesheet for {employee_name}, week {week_start}, from Xero and JWS. "
+            "The employee can now submit a replacement timesheet for the same week.",
+            "success",
+        )
+        return redirect(url_for("management"))
+    except Exception as exc:
+        # External cleanup can be partially complete if Xero rejects a later
+        # operation.  We preserve the JWS timesheet so the Primary Admin can
+        # safely retry; already-deleted Xero records are treated as cleared.
+        db.session.rollback()
+        flash(
+            "The timesheet was not deleted from JWS because Xero cleanup did not fully complete. "
+            f"You can safely retry after reviewing this message: {exc}",
+            "error",
+        )
+        return redirect(url_for("timesheet_summary", tsid=tsid))
+
 
 @app.post("/timesheet/<int:tsid>/<action>")
 @manager_required
