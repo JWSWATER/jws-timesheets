@@ -2,6 +2,13 @@
 {% if user.can_timesheet %}<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a>{% endif %}<div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a><div class="spacer"></div><a href="/change-password">🔒 Change Password</a><a href="/logout">↪ Logout</a></nav></aside>
 <main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ "Primary Admin" if user.is_primary_admin else ("Administrator" if user.role=="manager" and not user.can_timesheet else user.role|title) }}</div></div></header><section class="content">
 <h1>Full Timesheet Summary</h1>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    {% for category, message in messages %}
+      <div class="card panel"><div class="{{ 'error' if category == 'error' else 'notice' }}">{{ message }}</div></div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
 <p><b>{{ employee.name }}</b> · Week {{ ts.week_start }} · Status: <b>{{ ts.status|title }}</b></p>
 {% if ts.amended_at %}<p class="muted">Last amended {{ ts.amended_at.strftime('%d %b %Y %H:%M') }}{% if amended_by %} by {{ amended_by.name }}{% endif %}.</p>{% endif %}
 {% if user.is_primary_admin %}
