@@ -944,7 +944,10 @@ def xero_find_or_create_task(project_id, description, token=None):
         f"/projects/{project_id}/tasks",
         token=token,
         body=body,
-        idempotency_key=_xero_idempotency("task", f"{project_id}|{wanted}"),
+        idempotency_key=_xero_idempotency(
+            "task-v2",
+            f"{project_id}|{json.dumps(body, sort_keys=True, separators=(',', ':'))}"
+        ),
     )
 
 
@@ -1063,7 +1066,11 @@ def export_timesheet_to_xero_projects(ts):
                 f"/projects/{project_id}/time",
                 token=token,
                 body=payload,
-                idempotency_key=_xero_idempotency("time", f"entry-{entry.id}"),
+                idempotency_key=_xero_idempotency(
+                    "time-v2",
+                    f"entry-{entry.id}|{project_id}|"
+                    f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
+                ),
             ) or {}
 
             time_entry_id = created.get("timeEntryId")
