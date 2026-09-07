@@ -876,6 +876,26 @@ def xero_get_project_staff_members(token=None):
     return list(merged.values())
 
 
+def xero_get_project(project_id, token=None):
+    """Retrieve one project by its Xero projectId."""
+    token = token or xero_access_token()
+    return xero_api_request(
+        "GET",
+        f"/projects/{project_id}",
+        token=token,
+    )
+
+
+def xero_get_project_task(project_id, task_id, token=None):
+    """Retrieve one task from one Xero project."""
+    token = token or xero_access_token()
+    return xero_api_request(
+        "GET",
+        f"/projects/{project_id}/tasks/{task_id}",
+        token=token,
+    )
+
+
 def xero_get_project_tasks(project_id, token=None):
     token = token or xero_access_token()
     tasks = []
@@ -953,13 +973,14 @@ def xero_find_or_create_task(project_id, description, token=None):
 
 def xero_resolve_project_user(employee, token=None):
     """
-    Xero's own UI can display a wider 'Staff member' list, but the public
-    Projects API only accepts userIds returned by /projectsusers.
+    Resolve the explicitly selected Xero Staff Member to the userId accepted by
+    the Projects API.
 
-    Keep the broader staff selection in JWS for identification, but validate
-    the selected person before attempting to create project time.
+    The employee dropdown can be sourced from Accounting /Users, while time
+    entry creation requires a userId present in /projectsusers. If those IDs
+    differ, remap safely by the Xero staff name the manager already selected.
     """
-    if not employee.xero_project_user_id:
+    if not employee.xero_project_user_id and not employee.xero_project_user_name:
         raise RuntimeError(
             f"{employee.name} is not mapped to a Xero Staff Member. "
             "Open Employees and choose the correct Xero Staff Member."
@@ -967,27 +988,48 @@ def xero_resolve_project_user(employee, token=None):
 
     token = token or xero_access_token()
     project_users = xero_get_project_users(token=token)
-    eligible = {
+
+    by_id = {
         (item.get("userId") or "").strip(): item
         for item in project_users
         if (item.get("userId") or "").strip()
     }
 
-    if employee.xero_project_user_id not in eligible:
-        selected_name = employee.xero_project_user_name or employee.name
+    # Best case: the selected ID is already a valid Projects userId.
+    if employee.xero_project_user_id in by_id:
+        matched = by_id[employee.xero_project_user_id]
+        if matched.get("name"):
+            employee.xero_project_user_name = matched.get("name")
+            db.session.commit()
+        return employee.xero_project_user_id
+
+    # Accounting Users and Projects Users can be different lists. Because the
+    # manager has explicitly selected the Xero Staff Member, an exact-name
+    # remap here is safe and avoids relying on the JWS display name.
+    selected_name = (employee.xero_project_user_name or "").strip()
+    name_matches = [
+        item for item in project_users
+        if (item.get("name") or "").strip().casefold() == selected_name.casefold()
+    ]
+
+    if len(name_matches) == 1:
+        matched = name_matches[0]
+        employee.xero_project_user_id = matched.get("userId")
+        employee.xero_project_user_name = matched.get("name") or selected_name
+        db.session.commit()
+        return employee.xero_project_user_id
+
+    if not name_matches:
         raise RuntimeError(
-            f"{selected_name} is visible as a Xero Staff Member but is not currently "
-            "an active Xero Projects user. In Xero, give this person Projects -> "
-            "Limited access, then retry. No additional accounting access is required."
+            f"{selected_name or employee.name} is selected as the Xero Staff Member, "
+            "but Xero does not currently return that person from /projectsusers. "
+            "Confirm Projects access is enabled for that person, then retry."
         )
 
-    # Refresh the stored display name from Xero Projects when available.
-    matched = eligible[employee.xero_project_user_id]
-    if matched.get("name") and matched.get("name") != employee.xero_project_user_name:
-        employee.xero_project_user_name = matched.get("name")
-        db.session.commit()
-
-    return employee.xero_project_user_id
+    raise RuntimeError(
+        f"More than one Xero Projects user matches '{selected_name}'. "
+        "Open Employees and re-select the correct Xero Staff Member."
+    )
 
 def hhmm_minutes(start, finish):
     if not start or not finish:
@@ -1069,10 +1111,58 @@ def export_timesheet_to_xero_projects(ts):
                 raise RuntimeError(f"{entry.work_date}: a Description is required for Xero task creation.")
 
             project_id = entry.project.external_id
+
+            # Verify the local Xero Project mapping still points to a live
+            # Xero Project before creating/logging time.
+            try:
+                live_project = xero_get_project(project_id, token=token) or {}
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{entry.work_date}: the linked Xero Project could not be retrieved. "
+                    "Run Projects -> Sync from Xero, then retry. "
+                    f"Xero detail: {exc}"
+                ) from exc
+
+            if (live_project.get("projectId") or "").strip() != project_id:
+                raise RuntimeError(
+                    f"{entry.work_date}: Xero returned a different Project ID than expected. "
+                    "Run Projects -> Sync from Xero before retrying."
+                )
+
             task = xero_find_or_create_task(project_id, description, token=token)
             task_id = (task or {}).get("taskId")
             if not task_id:
                 raise RuntimeError(f"Xero did not return a Task ID for '{description[:100]}'.")
+
+            # Verify the task really belongs to this exact project.
+            try:
+                live_task = xero_get_project_task(project_id, task_id, token=token) or {}
+            except Exception:
+                # One recovery attempt: re-read the project's active tasks and
+                # find the exact task name again.
+                wanted_task_name = description.strip()[:100].casefold()
+                live_matches = [
+                    t for t in xero_get_project_tasks(project_id, token=token)
+                    if (t.get("name") or "").strip().casefold() == wanted_task_name
+                    and (t.get("status") or "ACTIVE") == "ACTIVE"
+                ]
+                if len(live_matches) == 1:
+                    live_task = live_matches[0]
+                    task_id = live_task.get("taskId")
+                else:
+                    raise RuntimeError(
+                        f"{entry.work_date}: Xero task '{description[:100]}' could not be "
+                        "verified on the selected project."
+                    )
+
+            if (live_task.get("projectId") or "").strip() not in ("", project_id):
+                raise RuntimeError(
+                    f"{entry.work_date}: the Xero task belongs to a different project."
+                )
+            if (live_task.get("taskId") or "").strip() != task_id:
+                raise RuntimeError(
+                    f"{entry.work_date}: Xero returned a different Task ID than expected."
+                )
 
             duration = hhmm_minutes(entry.start_time, entry.finish_time)
             if duration < 1:
@@ -1085,17 +1175,28 @@ def export_timesheet_to_xero_projects(ts):
                 "duration": duration,
                 "description": description,
             }
-            created = xero_api_request(
-                "POST",
-                f"/projects/{project_id}/time",
-                token=token,
-                body=payload,
-                idempotency_key=_xero_idempotency(
-                    "time-v2",
-                    f"entry-{entry.id}|{project_id}|"
-                    f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
-                ),
-            ) or {}
+            try:
+                created = xero_api_request(
+                    "POST",
+                    f"/projects/{project_id}/time",
+                    token=token,
+                    body=payload,
+                    idempotency_key=_xero_idempotency(
+                        "time-v3",
+                        f"entry-{entry.id}|{project_id}|"
+                        f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
+                    ),
+                ) or {}
+            except RuntimeError as exc:
+                if "(404)" in str(exc):
+                    raise RuntimeError(
+                        f"{entry.work_date}: Xero verified the Project, Task and Staff Member, "
+                        "but rejected creation of the time entry with 404. "
+                        f"Project={project_id}, Task={task_id}, Staff={xero_user_id}. "
+                        "This narrows the issue to Xero's time-entry permission/resource handling. "
+                        f"Original Xero response: {exc}"
+                    ) from exc
+                raise
 
             time_entry_id = created.get("timeEntryId")
             if not time_entry_id:
