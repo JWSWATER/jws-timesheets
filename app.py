@@ -1045,11 +1045,122 @@ def xero_get_employee_pay_template(employee_id, token=None):
     return template.get("earningTemplates") or template.get("earningsTemplates") or []
 
 
+def xero_get_employee_salary_and_wages(employee_id, token=None):
+    """Return all Xero Salary & Wages records for an employee.
+
+    Xero's primary/ordinary earnings item (for example "Regular Hours") is
+    represented by Salary & Wages, not necessarily by the employee Pay Template
+    earnings collection.  That distinction matters when resolving the earnings
+    rate used on Payroll timesheet lines.
+    """
+    token = token or xero_access_token()
+    records = []
+    page = 1
+    while True:
+        payload = xero_payroll_request(
+            "GET", f"/Employees/{employee_id}/SalaryAndWages", token=token, query={"page": page}
+        ) or {}
+        values = payload.get("salaryAndWages") or []
+        if isinstance(values, dict):
+            values = [values]
+        records.extend(values)
+        pagination = payload.get("pagination") or {}
+        page_count = int(pagination.get("pageCount") or 1)
+        if page >= page_count:
+            break
+        page += 1
+    return records
+
+
+def xero_get_earning_rate(earnings_rate_id, token=None):
+    token = token or xero_access_token()
+    payload = xero_payroll_request("GET", f"/earningsRates/{earnings_rate_id}", token=token) or {}
+    return payload.get("earningsRate") or {}
+
+
 def _money_close(a, b, tolerance=0.011):
     try:
         return abs(float(a) - float(b)) <= tolerance
     except (TypeError, ValueError):
         return False
+
+
+def xero_resolve_normal_earnings(employee_id, local_rate, token=None, as_of_date=None):
+    """Resolve the employee's ordinary earnings rate from Salary & Wages.
+
+    The Xero Payroll UI shows ordinary pay on the Pay template screen, but the
+    API exposes that primary row through SalaryAndWages.  Additional items such
+    as overtime remain in PayTemplates.
+    """
+    token = token or xero_access_token()
+    records = xero_get_employee_salary_and_wages(employee_id, token=token)
+    if not records:
+        raise RuntimeError("Xero returned no Salary & Wages record for this employee.")
+
+    target_date = date.today()
+    if as_of_date:
+        try:
+            target_date = date.fromisoformat(_xero_date_only(as_of_date))
+        except ValueError:
+            target_date = date.today()
+
+    candidates = []
+    for record in records:
+        earnings_rate_id = (record.get("earningsRateID") or "").strip()
+        if not earnings_rate_id:
+            continue
+        status = (record.get("status") or "").strip().casefold()
+        if status and status not in ("active", "current"):
+            continue
+        if local_rate and not _money_close(record.get("ratePerUnit"), local_rate):
+            continue
+
+        effective_text = _xero_date_only(record.get("effectiveFrom"))
+        effective_date = date.min
+        if effective_text:
+            try:
+                effective_date = date.fromisoformat(effective_text)
+            except ValueError:
+                effective_date = date.min
+        if target_date and effective_date != date.min and effective_date > target_date:
+            continue
+        candidates.append((effective_date, record))
+
+    if not candidates:
+        rate_text = f"£{float(local_rate):.2f}" if local_rate else "the configured rate"
+        raise RuntimeError(
+            f"Could not map JWS NORMAL to an active Xero Salary & Wages record at {rate_text}. "
+            "Check the employee's Salary & Wages / Regular Hours setup in Xero."
+        )
+
+    # Xero can retain historic Salary & Wages records.  For the requested pay
+    # period, use the most recent effective matching record.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    chosen = candidates[0][1]
+    earnings_rate_id = (chosen.get("earningsRateID") or "").strip()
+    rate_detail = xero_get_earning_rate(earnings_rate_id, token=token)
+    name = (rate_detail.get("name") or "Regular Hours").strip()
+    if name.casefold() != "regular hours".casefold():
+        raise RuntimeError(
+            f"The employee's ordinary Salary & Wages item is '{name}', not 'Regular Hours'. "
+            "Review the Xero pay setup before exporting payroll."
+        )
+
+    xero_rate = chosen.get("ratePerUnit")
+    if local_rate and xero_rate is not None and not _money_close(xero_rate, local_rate):
+        raise RuntimeError(
+            f"JWS NORMAL rate (£{float(local_rate):.2f}) does not match Xero "
+            f"'{name}' (£{float(xero_rate):.2f}). Update the employee setup before export."
+        )
+
+    # Return the same shape used by pay-template items so downstream allocation
+    # code can remain unchanged.
+    return {
+        "name": name,
+        "earningsRateID": earnings_rate_id,
+        "ratePerUnit": xero_rate,
+        "salaryAndWagesID": chosen.get("salaryAndWagesID"),
+    }
 
 
 def xero_resolve_earning_template(items, band, local_rate):
@@ -1116,7 +1227,7 @@ def xero_resolve_holiday_leave_type(employee_id, token=None):
     return matches[0]
 
 
-def xero_payroll_preflight(employee, token=None, require_ot2=False):
+def xero_payroll_preflight(employee, token=None, require_ot2=False, as_of_date=None):
     token = token or xero_access_token()
     detail = xero_resolve_payroll_employee(employee, token=token)
     employee_id = (detail.get("employeeID") or "").strip()
@@ -1127,7 +1238,9 @@ def xero_payroll_preflight(employee, token=None, require_ot2=False):
     calendar = xero_get_payroll_calendar(calendar_id, token=token)
     xero_validate_weekly_calendar(calendar)
     earnings = xero_get_employee_pay_template(employee_id, token=token)
-    normal_item = xero_resolve_earning_template(earnings, "normal", float(employee.basic_rate or 0))
+    normal_item = xero_resolve_normal_earnings(
+        employee_id, float(employee.basic_rate or 0), token=token, as_of_date=as_of_date
+    )
     ot1_item = xero_resolve_earning_template(earnings, "ot1", float(employee.ot1_rate or 0))
     ot2_item = None
     if require_ot2:
@@ -1371,7 +1484,9 @@ def export_timesheet_to_xero_payroll(ts):
     daily_hours = payroll_daily_worked_hours(ts.id)
     total_worked = round(sum(daily_hours.values()), 4)
     _, _, ot2_total = worked_band_totals(ts.user, total_worked)
-    profile = xero_payroll_preflight(ts.user, token=token, require_ot2=ot2_total > 0.0001)
+    profile = xero_payroll_preflight(
+        ts.user, token=token, require_ot2=ot2_total > 0.0001, as_of_date=ts.week_start
+    )
 
     # Public holidays are intentionally left to Xero's Holiday Group. If the
     # employee actually worked on a public holiday, stop rather than guessing
