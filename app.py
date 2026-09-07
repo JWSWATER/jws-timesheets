@@ -973,63 +973,66 @@ def xero_find_or_create_task(project_id, description, token=None):
 
 def xero_resolve_project_user(employee, token=None):
     """
-    Resolve the explicitly selected Xero Staff Member to the userId accepted by
-    the Projects API.
+    Resolve the Xero Staff Member selected by the manager.
 
-    The employee dropdown can be sourced from Accounting /Users, while time
-    entry creation requires a userId present in /projectsusers. If those IDs
-    differ, remap safely by the Xero staff name the manager already selected.
+    Xero's current UI can allow a Staff member to record project time even
+    when that employee is not returned by /ProjectsUsers. We therefore:
+      1. Prefer an exact ProjectsUsers ID match.
+      2. If the selected Xero staff name has one ProjectsUsers match, use it.
+      3. Otherwise use the explicitly selected organisation UserID.
+
+    This avoids blocking valid Xero Employee-role staff such as William
+    McKibbin solely because /ProjectsUsers omits them.
     """
-    if not employee.xero_project_user_id and not employee.xero_project_user_name:
+    if not employee.xero_project_user_id:
         raise RuntimeError(
             f"{employee.name} is not mapped to a Xero Staff Member. "
             "Open Employees and choose the correct Xero Staff Member."
         )
 
-    token = token or xero_access_token()
-    project_users = xero_get_project_users(token=token)
+    selected_id = employee.xero_project_user_id
+    selected_name = (employee.xero_project_user_name or employee.name).strip()
 
+    token = token or xero_access_token()
+
+    try:
+        project_users = xero_get_project_users(token=token)
+    except Exception:
+        project_users = []
+
+    # If Xero Projects returns the exact same ID, use it.
     by_id = {
         (item.get("userId") or "").strip(): item
         for item in project_users
         if (item.get("userId") or "").strip()
     }
-
-    # Best case: the selected ID is already a valid Projects userId.
-    if employee.xero_project_user_id in by_id:
-        matched = by_id[employee.xero_project_user_id]
+    if selected_id in by_id:
+        matched = by_id[selected_id]
         if matched.get("name"):
             employee.xero_project_user_name = matched.get("name")
             db.session.commit()
-        return employee.xero_project_user_id
+        return selected_id
 
-    # Accounting Users and Projects Users can be different lists. Because the
-    # manager has explicitly selected the Xero Staff Member, an exact-name
-    # remap here is safe and avoids relying on the JWS display name.
-    selected_name = (employee.xero_project_user_name or "").strip()
+    # If Xero Projects exposes the same explicitly-selected Xero name under a
+    # different Projects userId, safely remap to that ID.
     name_matches = [
         item for item in project_users
         if (item.get("name") or "").strip().casefold() == selected_name.casefold()
     ]
-
     if len(name_matches) == 1:
         matched = name_matches[0]
-        employee.xero_project_user_id = matched.get("userId")
-        employee.xero_project_user_name = matched.get("name") or selected_name
-        db.session.commit()
-        return employee.xero_project_user_id
+        project_user_id = (matched.get("userId") or "").strip()
+        if project_user_id:
+            employee.xero_project_user_id = project_user_id
+            employee.xero_project_user_name = matched.get("name") or selected_name
+            db.session.commit()
+            return project_user_id
 
-    if not name_matches:
-        raise RuntimeError(
-            f"{selected_name or employee.name} is selected as the Xero Staff Member, "
-            "but Xero does not currently return that person from /projectsusers. "
-            "Confirm Projects access is enabled for that person, then retry."
-        )
-
-    raise RuntimeError(
-        f"More than one Xero Projects user matches '{selected_name}'. "
-        "Open Employees and re-select the correct Xero Staff Member."
-    )
+    # Xero's web UI may expose Employee-role staff in the Staff member selector
+    # even when /ProjectsUsers doesn't list them. The organisation UserID is
+    # still the Xero identifier selected by the manager, so allow the actual
+    # Time API to determine whether it is accepted.
+    return selected_id
 
 def hhmm_minutes(start, finish):
     if not start or not finish:
@@ -1182,7 +1185,7 @@ def export_timesheet_to_xero_projects(ts):
                     token=token,
                     body=payload,
                     idempotency_key=_xero_idempotency(
-                        "time-v4",
+                        "time-v5-staff-fallback",
                         f"entry-{entry.id}|{project_id}|"
                         f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
                     ),
@@ -1190,10 +1193,10 @@ def export_timesheet_to_xero_projects(ts):
             except RuntimeError as exc:
                 if "(404)" in str(exc):
                     raise RuntimeError(
-                        f"{entry.work_date}: Xero verified the Project, Task and Staff Member, "
-                        "but rejected creation of the time entry with 404. "
-                        f"Project={project_id}, Task={task_id}, Staff={xero_user_id}. "
-                        "This narrows the issue to Xero's time-entry permission/resource handling. "
+                        f"{entry.work_date}: Xero accepted the Project and Task, but rejected "
+                        f"the time entry for Staff Member '{ts.user.xero_project_user_name or ts.user.name}' "
+                        f"with 404. Project={project_id}, Task={task_id}, StaffID={xero_user_id}. "
+                        "The selected employee has been sent using the Xero UserID from the Staff/User list. "
                         f"Original Xero response: {exc}"
                     ) from exc
                 raise
