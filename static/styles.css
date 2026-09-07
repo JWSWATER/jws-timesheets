@@ -80,6 +80,3 @@
 @media(max-width:600px){
   .admin-actions{justify-content:flex-start;margin-top:8px}
 }
-
-/* Staff member mapping / management-only admins */
-.xero-mapping-help{margin-top:0;margin-bottom:14px}

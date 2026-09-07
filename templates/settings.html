@@ -3,10 +3,8 @@
   <aside class="sidebar">
     <div class="brand"><img src="/static/assets/jws-water-logo.png" alt="JWS Water"></div>
     <nav class="nav">
-      {% if user.can_timesheet %}
       <a href="/dashboard">▣ My Timesheet</a>
       <a href="/history">◷ History</a>
-      {% endif %}
       <div class="spacer"></div>
       <a href="/management">👥 Manager View</a>
       <a href="/employees">👤 Employees</a>
@@ -32,7 +30,7 @@
       <div class="settings-grid">
         <div class="card panel">
           <h2>Timesheet Submission Emails</h2>
-          <p class="muted">Everyone on this list receives an email whenever an employee submits a timesheet for approval.</p>
+          <p class="muted">Everyone on this list receives a Microsoft 365 email whenever an employee submits a timesheet for approval.</p>
 
           {% if notification_emails %}
             <div class="recipient-list">
@@ -59,22 +57,20 @@
 
           <div class="smtp-status">
             <b>Email service:</b>
-            {% if smtp_configured %}
-              Configured
+            {% if mail_configured %}
+              Microsoft 365 · Configured
             {% else %}
-              Not configured
+              Microsoft 365 · Not configured
             {% endif %}
           </div>
 
-          {% if not smtp_configured %}
+          {% if not mail_configured %}
           <div class="settings-help">
             <b>Railway variables required:</b><br>
-            SMTP_HOST<br>
-            SMTP_PORT<br>
-            SMTP_USERNAME<br>
-            SMTP_PASSWORD<br>
-            SMTP_FROM_EMAIL<br>
-            SMTP_USE_TLS = true
+            M365_TENANT_ID<br>
+            M365_CLIENT_ID<br>
+            M365_CLIENT_SECRET<br>
+            M365_FROM_EMAIL
           </div>
           {% endif %}
 
@@ -95,7 +91,6 @@
           <p class="muted">
             The Primary Admin account is permanently protected. Additional admins can use management functions,
             but only the Primary Admin can add, disable, enable or remove administrator accounts.
-            Additional admins do not have a personal timesheet or employee pay/overtime rates.
           </p>
 
           <div class="admin-list">
@@ -139,7 +134,7 @@
             <label>Temporary password<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
             <button class="btn primary" type="submit">Add Admin User</button>
           </form>
-          <p class="muted">The new admin can use Change Password after signing in. They will open directly into Manager View and will not have My Timesheet or pay-rate settings.</p>
+          <p class="muted">The new admin can use Change Password after signing in.</p>
           {% else %}
           <div class="settings-help">
             Only the Primary Admin can create, disable or remove admin accounts.

@@ -5,15 +5,11 @@ import json
 import hashlib
 import math
 import re
-import smtplib
-import ssl
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from datetime import datetime, date, timedelta
 from functools import wraps
-from email.message import EmailMessage
-from email.utils import parseaddr
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
 from flask_sqlalchemy import SQLAlchemy
@@ -538,8 +534,10 @@ XERO_PROJECTS_URL = f"{XERO_PROJECTS_BASE_URL}/Projects"
 
 def _valid_email(value):
     value = (value or "").strip()
-    parsed = parseaddr(value)[1]
-    return bool(parsed and "@" in parsed and "." in parsed.rsplit("@", 1)[-1])
+    if not value or "@" not in value:
+        return False
+    local, domain = value.rsplit("@", 1)
+    return bool(local and domain and "." in domain and " " not in value)
 
 
 def get_submission_notification_emails():
@@ -576,55 +574,116 @@ def set_submission_notification_emails(values):
     return clean
 
 
-def smtp_is_configured():
-    return bool(
-        os.environ.get("SMTP_HOST", "").strip()
-        and os.environ.get("SMTP_FROM_EMAIL", "").strip()
+def graph_mail_is_configured():
+    return all([
+        os.environ.get("M365_TENANT_ID", "").strip(),
+        os.environ.get("M365_CLIENT_ID", "").strip(),
+        os.environ.get("M365_CLIENT_SECRET", "").strip(),
+        os.environ.get("M365_FROM_EMAIL", "").strip(),
+    ])
+
+
+def microsoft_graph_access_token():
+    tenant_id = os.environ.get("M365_TENANT_ID", "").strip()
+    client_id = os.environ.get("M365_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("M365_CLIENT_SECRET", "").strip()
+
+    if not tenant_id or not client_id or not client_secret:
+        raise RuntimeError(
+            "Microsoft 365 email is not configured in Railway."
+        )
+
+    token_url = (
+        "https://login.microsoftonline.com/"
+        f"{quote(tenant_id, safe='')}/oauth2/v2.0/token"
+    )
+    body = urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }).encode("utf-8")
+
+    req = Request(
+        token_url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Microsoft login failed ({exc.code}): {detail[:700]}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(
+            f"Could not contact Microsoft login: {exc.reason}"
+        ) from exc
+
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError("Microsoft did not return an access token.")
+    return token
+
+
+def send_graph_message(to_email, subject, text_body):
+    from_email = os.environ.get("M365_FROM_EMAIL", "").strip()
+    if not from_email:
+        raise RuntimeError("M365_FROM_EMAIL is not configured in Railway.")
+
+    token = microsoft_graph_access_token()
+    endpoint = (
+        "https://graph.microsoft.com/v1.0/users/"
+        f"{quote(from_email, safe='@.')}/sendMail"
     )
 
+    body = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "Text",
+                "content": text_body,
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": to_email
+                    }
+                }
+            ],
+        },
+        "saveToSentItems": True,
+    }
 
-def send_smtp_message(to_email, subject, text_body):
-    host = os.environ.get("SMTP_HOST", "").strip()
-    if not host:
-        raise RuntimeError("SMTP_HOST is not configured in Railway.")
-
-    from_email = os.environ.get("SMTP_FROM_EMAIL", "").strip()
-    if not from_email:
-        raise RuntimeError("SMTP_FROM_EMAIL is not configured in Railway.")
-
-    username = os.environ.get("SMTP_USERNAME", "").strip()
-    password = os.environ.get("SMTP_PASSWORD", "")
-    use_ssl = os.environ.get("SMTP_USE_SSL", "false").strip().lower() in ("1", "true", "yes", "on")
-    use_tls = os.environ.get("SMTP_USE_TLS", "true").strip().lower() in ("1", "true", "yes", "on")
-
+    req = Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
     try:
-        default_port = 465 if use_ssl else 587
-        port = int(os.environ.get("SMTP_PORT", str(default_port)))
-    except ValueError:
-        port = 465 if use_ssl else 587
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = from_email
-    msg["To"] = to_email
-    msg.set_content(text_body)
-
-    if use_ssl:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(host, port, timeout=25, context=context) as smtp:
-            if username:
-                smtp.login(username, password)
-            smtp.send_message(msg)
-    else:
-        with smtplib.SMTP(host, port, timeout=25) as smtp:
-            smtp.ehlo()
-            if use_tls:
-                context = ssl.create_default_context()
-                smtp.starttls(context=context)
-                smtp.ehlo()
-            if username:
-                smtp.login(username, password)
-            smtp.send_message(msg)
+        with urlopen(req, timeout=30) as response:
+            # Graph sendMail returns 202 Accepted on success.
+            if response.status != 202:
+                raise RuntimeError(
+                    f"Microsoft Graph returned unexpected status {response.status}."
+                )
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Microsoft Graph sendMail failed ({exc.code}): {detail[:900]}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(
+            f"Could not contact Microsoft Graph: {exc.reason}"
+        ) from exc
 
 
 def notify_timesheet_submitted(ts):
@@ -632,10 +691,10 @@ def notify_timesheet_submitted(ts):
     if not recipients:
         return 0
 
-    if not smtp_is_configured():
+    if not graph_mail_is_configured():
         raise RuntimeError(
-            "Submission notification recipients are configured, but SMTP email "
-            "has not been configured in Railway."
+            "Submission notification recipients are configured, but Microsoft 365 "
+            "email has not been configured in Railway."
         )
 
     employee = ts.user
@@ -657,7 +716,7 @@ def notify_timesheet_submitted(ts):
     # Send separate copies so recipient addresses are not exposed to one another.
     for recipient in recipients:
         try:
-            send_smtp_message(recipient, subject, body)
+            send_graph_message(recipient, subject, body)
             sent += 1
         except Exception as exc:
             errors.append(f"{recipient}: {exc}")
@@ -1692,7 +1751,7 @@ def settings():
         user=current_user(),
         xero_configured=xero_is_configured(),
         notification_emails=get_submission_notification_emails(),
-        smtp_configured=smtp_is_configured(),
+        mail_configured=graph_mail_is_configured(),
         submission_email_last_error=app_setting_get("submission_email_last_error", ""),
         submission_email_last_sent_at=app_setting_get("submission_email_last_sent_at", ""),
         admins=admins,
@@ -1740,9 +1799,10 @@ def settings_notification_email_test():
         flash("Add at least one notification email address first.", "error")
         return redirect(url_for("settings"))
 
-    if not smtp_is_configured():
+    if not graph_mail_is_configured():
         flash(
-            "SMTP is not configured in Railway yet. Add the SMTP variables shown on this page.",
+            "Microsoft 365 email is not configured in Railway yet. "
+            "Add the Microsoft Graph variables shown on this page.",
             "error",
         )
         return redirect(url_for("settings"))
@@ -1759,7 +1819,7 @@ def settings_notification_email_test():
     sent = 0
     for recipient in recipients:
         try:
-            send_smtp_message(recipient, subject, body)
+            send_graph_message(recipient, subject, body)
             sent += 1
         except Exception as exc:
             errors.append(f"{recipient}: {exc}")
