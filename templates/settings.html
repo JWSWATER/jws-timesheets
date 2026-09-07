@@ -145,14 +145,25 @@
         <div class="card panel">
           <h2>Xero</h2>
           <div class="notice">
-            <b>Xero Projects connection:</b>
+            <b>Xero connection:</b>
             {% if xero_configured %}
               credentials are configured.
             {% else %}
               not configured. Add <b>XERO_CLIENT_ID</b> and <b>XERO_CLIENT_SECRET</b> to Railway.
             {% endif %}
           </div>
-          <p class="muted">Employee Xero Payroll IDs are managed from the Employees page. Xero Projects users remain a separate one-time mapping.</p>
+          <p class="muted">
+            Projects sends full Start–Finish project time. Payroll sends net worked hours after breaks,
+            creates Annual Leave against the employee's assigned Holiday leave type, leaves standard Public Holidays to Xero's Holiday Group,
+            and automatically approves the Xero Payroll timesheet. The bookkeeper still creates/checks the pay run.
+          </p>
+          <p class="muted">Employee Xero Payroll IDs are managed from the Employees page. Xero Projects Staff Member mapping remains separate.</p>
+          {% if xero_configured %}
+          <form method="post" action="/settings/xero-payroll/check">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn secondary" type="submit">Check Xero Payroll Setup</button>
+          </form>
+          {% endif %}
         </div>
       </div>
     </section>
