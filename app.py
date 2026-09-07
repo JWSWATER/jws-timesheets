@@ -3,6 +3,7 @@ import os
 import base64
 import json
 import hashlib
+import hmac
 import math
 import re
 from urllib.parse import urlencode, quote
@@ -18,6 +19,7 @@ from sqlalchemy import or_
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -46,7 +48,9 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(160), nullable=False)
     username = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    email = db.Column(db.String(255), nullable=True, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
+    password_reset_sent_at = db.Column(db.DateTime, nullable=True)
     role = db.Column(db.String(30), nullable=False, default="employee")
     active = db.Column(db.Boolean, nullable=False, default=True)
     normal_hours = db.Column(db.Float, nullable=False, default=40)
@@ -141,6 +145,16 @@ def init_db():
     try:
         inspector = db.inspect(db.engine)
         user_columns = {c["name"] for c in inspector.get_columns("users")}
+        if "email" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+                )
+        if "password_reset_sent_at" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN password_reset_sent_at TIMESTAMP"
+                )
         if "standard_day_hours" not in user_columns:
             with db.engine.begin() as conn:
                 conn.exec_driver_sql(
@@ -810,6 +824,152 @@ def send_graph_message(to_email, subject, text_body):
         raise RuntimeError(
             f"Could not contact Microsoft Graph: {exc.reason}"
         ) from exc
+
+
+PASSWORD_RESET_MAX_AGE_SECONDS = 30 * 60
+PASSWORD_RESET_RESEND_SECONDS = 2 * 60
+
+
+def _password_reset_serializer():
+    return URLSafeTimedSerializer(
+        app.config["SECRET_KEY"],
+        salt="jws-timesheets-password-reset-v1",
+    )
+
+
+def _password_reset_stamp(user):
+    return hashlib.sha256((user.password_hash or "").encode("utf-8")).hexdigest()[:24]
+
+
+def make_password_reset_token(user):
+    return _password_reset_serializer().dumps({
+        "uid": user.id,
+        "stamp": _password_reset_stamp(user),
+    })
+
+
+def verify_password_reset_token(token):
+    try:
+        data = _password_reset_serializer().loads(
+            token,
+            max_age=PASSWORD_RESET_MAX_AGE_SECONDS,
+        )
+    except SignatureExpired:
+        return None, "This password reset link has expired. Please request a new one."
+    except BadSignature:
+        return None, "This password reset link is invalid. Please request a new one."
+
+    try:
+        uid = int(data.get("uid"))
+    except (TypeError, ValueError, AttributeError):
+        return None, "This password reset link is invalid. Please request a new one."
+
+    user = db.session.get(User, uid)
+    if not user or not user.active:
+        return None, "This password reset link is invalid. Please request a new one."
+
+    supplied_stamp = str(data.get("stamp") or "")
+    if not hmac.compare_digest(supplied_stamp, _password_reset_stamp(user)):
+        return None, "This password reset link has already been used or is no longer valid."
+    return user, None
+
+
+def _password_reset_base_url():
+    configured = (os.environ.get("JWS_PUBLIC_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        return "https://timesheets.jwswater.com"
+    return request.url_root.rstrip("/")
+
+
+def _send_password_reset_email(user):
+    token = make_password_reset_token(user)
+    reset_url = _password_reset_base_url() + url_for("reset_password", token=token)
+    subject = "Reset your JWS Timesheets password"
+    body = (
+        f"Hello {user.name},\n\n"
+        "A password reset was requested for your JWS Timesheets account.\n\n"
+        f"Reset your password here:\n{reset_url}\n\n"
+        "This link expires in 30 minutes and becomes invalid as soon as your password is changed.\n\n"
+        "If you did not request this reset, you can ignore this email.\n\n"
+        "JWS Water Ltd\n"
+    )
+    send_graph_message(user.email, subject, body)
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        identifier = (request.form.get("identifier") or "").strip()
+        user = None
+        if identifier:
+            user = User.query.filter(
+                User.active.is_(True),
+                or_(
+                    db.func.lower(User.username) == identifier.lower(),
+                    db.func.lower(User.email) == identifier.lower(),
+                ),
+            ).first()
+
+        # Always show the same response to avoid revealing which accounts exist.
+        if user and _valid_email(user.email) and graph_mail_is_configured():
+            now = datetime.utcnow()
+            can_send = (
+                user.password_reset_sent_at is None
+                or (now - user.password_reset_sent_at).total_seconds() >= PASSWORD_RESET_RESEND_SECONDS
+            )
+            if can_send:
+                try:
+                    _send_password_reset_email(user)
+                    user.password_reset_sent_at = now
+                    app_setting_set("password_reset_last_error", "")
+                    app_setting_set("password_reset_last_sent_at", now.isoformat())
+                    db.session.commit()
+                except Exception as exc:
+                    db.session.rollback()
+                    try:
+                        app_setting_set("password_reset_last_error", str(exc)[:1200])
+                        db.session.commit()
+                    except Exception:
+                        db.session.rollback()
+
+        flash(
+            "If that account exists and has a reset email configured, a password reset link has been sent. "
+            "The link is valid for 30 minutes.",
+            "success",
+        )
+        return redirect(url_for("forgot_password"))
+
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    user, error = verify_password_reset_token(token)
+    if error:
+        flash(error, "error")
+        return redirect(url_for("forgot_password"))
+
+    if request.method == "POST":
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if len(new_password) < 8:
+            flash("Your new password must be at least 8 characters.", "error")
+        elif new_password != confirm_password:
+            flash("The new passwords do not match.", "error")
+        elif check_password_hash(user.password_hash, new_password):
+            flash("Your new password must be different from your current password.", "error")
+        else:
+            user.password_hash = generate_password_hash(new_password)
+            user.password_reset_sent_at = None
+            db.session.commit()
+            session.clear()
+            flash("Password reset successfully. Please sign in with your new password.", "success")
+            return redirect(url_for("login"))
+
+    return render_template("reset_password.html", account_name=user.name, token=token)
 
 
 def notify_timesheet_submitted(ts):
@@ -2921,16 +3081,21 @@ def employees():
     if request.method == "POST":
         f = request.form
         username = f["username"].strip()
+        email = (f.get("email") or "").strip()
         basis = (f.get("payroll_basis") or "hourly").strip().casefold()
         if basis not in ("hourly", "salaried"):
             basis = "hourly"
         if User.query.filter(db.func.lower(User.username) == username.lower()).first():
             flash("That username already exists.", "error")
+        elif email and not _valid_email(email):
+            flash("Enter a valid employee email address, or leave it blank.", "error")
+        elif email and User.query.filter(db.func.lower(User.email) == email.lower()).first():
+            flash("That email address is already assigned to another account.", "error")
         else:
             normal_hours = float(f.get("normal_hours") or 40)
             hourly = basis == "hourly"
             db.session.add(User(
-                name=f["name"].strip(), username=username,
+                name=f["name"].strip(), username=username, email=email or None,
                 password_hash=generate_password_hash(f["password"]), role="employee",
                 payroll_basis=basis,
                 normal_hours=normal_hours,
@@ -2965,6 +3130,27 @@ def employees():
                 "Confirm the Custom Connection includes accounting.settings.read "
                 "and has been re-authorised."
             )
+
+    # Where a timesheet user is already mapped to a Xero Staff Member, use the
+    # matching Xero email as their reset email if no account email is stored yet.
+    if xero_staff_members:
+        staff_by_id = {str(item.get("userId")): item for item in xero_staff_members if item.get("userId")}
+        changed = False
+        for row in rows:
+            if row.email or not row.xero_project_user_id:
+                continue
+            match = staff_by_id.get(str(row.xero_project_user_id))
+            candidate = (match or {}).get("email")
+            if candidate and _valid_email(candidate):
+                duplicate = User.query.filter(
+                    User.id != row.id,
+                    db.func.lower(User.email) == candidate.lower(),
+                ).first()
+                if not duplicate:
+                    row.email = candidate
+                    changed = True
+        if changed:
+            db.session.commit()
 
     return render_template(
         "employees.html",
@@ -3007,6 +3193,14 @@ def employee_xero_user(uid):
             raise RuntimeError("That Xero Staff Member could not be found.")
         employee.xero_project_user_id = selected_id
         employee.xero_project_user_name = match.get("name")
+        candidate_email = (match.get("email") or "").strip()
+        if not employee.email and _valid_email(candidate_email):
+            duplicate = User.query.filter(
+                User.id != employee.id,
+                db.func.lower(User.email) == candidate_email.lower(),
+            ).first()
+            if not duplicate:
+                employee.email = candidate_email
         db.session.commit()
         flash(f"{employee.name} mapped to Xero Staff Member {match.get('name')}.", "success")
     except Exception as exc:
@@ -3050,6 +3244,33 @@ def employee_payroll_id(uid):
         employee.xero_payroll_employee_name = None
     db.session.commit()
     flash(f"Payroll profile saved for {employee.name}: {basis.title()}.", "success")
+    return redirect(url_for("employees"))
+
+
+@app.post("/employees/<int:uid>/account-email")
+@primary_admin_required
+def employee_account_email(uid):
+    employee = _timesheet_payroll_user(uid)
+    if not employee:
+        return "Not found", 404
+
+    email = (request.form.get("email") or "").strip()
+    if email and not _valid_email(email):
+        flash("Enter a valid email address, or leave it blank.", "error")
+        return redirect(url_for("employees"))
+    if email:
+        duplicate = User.query.filter(
+            User.id != employee.id,
+            db.func.lower(User.email) == email.lower(),
+        ).first()
+        if duplicate:
+            flash(f"That email address is already assigned to {duplicate.name}.", "error")
+            return redirect(url_for("employees"))
+
+    employee.email = email or None
+    employee.password_reset_sent_at = None
+    db.session.commit()
+    flash(f"Password reset email saved for {employee.name}.", "success")
     return redirect(url_for("employees"))
 
 
@@ -3138,6 +3359,7 @@ def settings():
         mail_configured=graph_mail_is_configured(),
         submission_email_last_error=app_setting_get("submission_email_last_error", ""),
         submission_email_last_sent_at=app_setting_get("submission_email_last_sent_at", ""),
+        password_reset_last_error=app_setting_get("password_reset_last_error", ""),
         admins=admins,
     )
 
@@ -3267,10 +3489,14 @@ def settings_xero_payroll_check():
 def settings_admin_add():
     name = (request.form.get("name") or "").strip()
     username = (request.form.get("username") or "").strip()
+    email = (request.form.get("email") or "").strip()
     password = request.form.get("password") or ""
 
-    if not name or not username:
-        flash("Admin name and username are required.", "error")
+    if not name or not username or not email:
+        flash("Admin name, username and email are required.", "error")
+        return redirect(url_for("settings"))
+    if not _valid_email(email):
+        flash("Enter a valid admin email address.", "error")
         return redirect(url_for("settings"))
     if len(password) < 8:
         flash("Admin password must be at least 8 characters.", "error")
@@ -3278,10 +3504,14 @@ def settings_admin_add():
     if User.query.filter(db.func.lower(User.username) == username.lower()).first():
         flash("That username already exists.", "error")
         return redirect(url_for("settings"))
+    if User.query.filter(db.func.lower(User.email) == email.lower()).first():
+        flash("That email address is already assigned to another account.", "error")
+        return redirect(url_for("settings"))
 
     admin = User(
         name=name,
         username=username,
+        email=email,
         password_hash=generate_password_hash(password),
         role="manager",
         active=True,
@@ -3301,6 +3531,32 @@ def settings_admin_add():
     db.session.add(admin)
     db.session.commit()
     flash(f"Admin user {name} created.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.post("/settings/admins/<int:uid>/email")
+@primary_admin_required
+def settings_admin_email(uid):
+    admin = db.session.get(User, uid)
+    if not admin or admin.role != "manager":
+        return "Not found", 404
+
+    email = (request.form.get("email") or "").strip()
+    if not _valid_email(email):
+        flash("Enter a valid admin email address.", "error")
+        return redirect(url_for("settings"))
+    duplicate = User.query.filter(
+        User.id != admin.id,
+        db.func.lower(User.email) == email.lower(),
+    ).first()
+    if duplicate:
+        flash(f"That email address is already assigned to {duplicate.name}.", "error")
+        return redirect(url_for("settings"))
+
+    admin.email = email
+    admin.password_reset_sent_at = None
+    db.session.commit()
+    flash(f"Password reset email saved for {admin.name}.", "success")
     return redirect(url_for("settings"))
 
 

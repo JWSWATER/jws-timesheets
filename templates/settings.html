@@ -77,7 +77,7 @@
           {% endif %}
 
           {% if submission_email_last_error %}
-            <div class="error settings-error"><b>Last email error:</b> {{ submission_email_last_error }}</div>
+            <div class="error settings-error"><b>Last submission email error:</b> {{ submission_email_last_error }}</div>
           {% elif submission_email_last_sent_at %}
             <p class="muted">Last successful email: {{ submission_email_last_sent_at[:19].replace("T", " ") }} UTC</p>
           {% endif %}
@@ -86,6 +86,9 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="btn secondary" type="submit">Send Test Email</button>
           </form>
+          {% if password_reset_last_error %}
+            <div class="error settings-error"><b>Last password reset email error:</b> {{ password_reset_last_error }}</div>
+          {% endif %}
         </div>
 
         <div class="card panel">
@@ -102,6 +105,15 @@
                 <strong>{{ admin.name }}</strong>
                 {% if admin.is_primary_admin %}<span class="primary-admin-badge">Primary Admin · Protected</span>{% endif %}
                 <div class="muted">{{ admin.username }} · {{ "Active" if admin.active else "Disabled" }}</div>
+                {% if user.is_primary_admin %}
+                <form method="post" action="/settings/admins/{{admin.id}}/email" class="admin-email-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input name="email" type="email" value="{{ admin.email or '' }}" placeholder="Password reset email" required>
+                  <button class="btn secondary" type="submit">Save Email</button>
+                </form>
+                {% else %}
+                  <div class="muted">{{ admin.email or 'No reset email configured' }}</div>
+                {% endif %}
               </div>
 
               <div class="admin-actions">
@@ -133,6 +145,7 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <label>Name<input name="name" required placeholder="Accountant / bookkeeper name"></label>
             <label>Username<input name="username" required autocomplete="off"></label>
+            <label>Email<input name="email" type="email" required autocomplete="email"></label>
             <label>Temporary password<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
             <button class="btn primary" type="submit">Add Admin User</button>
           </form>
