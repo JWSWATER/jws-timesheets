@@ -64,6 +64,7 @@ class User(db.Model):
     xero_project_user_name = db.Column(db.String(200), nullable=True)
     xero_payroll_id = db.Column(db.String(120), nullable=True, index=True)
     is_primary_admin = db.Column(db.Boolean, nullable=False, default=False)
+    can_timesheet = db.Column(db.Boolean, nullable=False, default=True)
 
 class Project(db.Model):
     __tablename__ = "projects"
@@ -165,6 +166,11 @@ def init_db():
                 conn.exec_driver_sql(
                     "ALTER TABLE users ADD COLUMN is_primary_admin BOOLEAN NOT NULL DEFAULT FALSE"
                 )
+        if "can_timesheet" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN can_timesheet BOOLEAN NOT NULL DEFAULT TRUE"
+                )
 
         entry_columns = {c["name"] for c in inspector.get_columns("entries")}
         if "xero_task_id" not in entry_columns:
@@ -248,6 +254,17 @@ def init_db():
             if primary:
                 primary.is_primary_admin = True
                 primary.active = True
+
+        # Outside accountants/bookkeepers are management-only accounts.
+        # They do not have their own timesheet or pay-rate profile.
+        User.query.filter(
+            User.role == "manager",
+            User.is_primary_admin.is_(False),
+        ).update({"can_timesheet": False}, synchronize_session=False)
+
+        # Keep the original Primary Admin unchanged.
+        if primary:
+            primary.can_timesheet = True
     except Exception:
         db.session.rollback()
         raise
@@ -370,6 +387,9 @@ def logout():
 def dashboard():
     u = current_user()
 
+    if u.role == "manager" and not u.can_timesheet:
+        return redirect(url_for("management"))
+
     # Keep Xero projects fresh automatically. If Xero is unavailable,
     # the employee can still use the last successfully cached list.
     maybe_sync_xero_projects()
@@ -411,6 +431,8 @@ def dashboard():
 def save_timesheet():
     data = request.get_json(force=True)
     u = current_user()
+    if not u.can_timesheet:
+        return jsonify({"ok": False, "error": "This administrator account does not have a timesheet."}), 403
     week = data["week"]
     ts = Timesheet.query.filter_by(user_id=u.id, week_start=week).first()
     if not ts:
@@ -736,6 +758,15 @@ def xero_get_project_users(token=None):
     return users
 
 
+def xero_get_project_staff_members(token=None):
+    """
+    Xero's Projects API names this resource ProjectsUsers, while the Xero
+    screen labels the selectable person as Staff member. These records provide
+    the userId required when creating a Projects time entry.
+    """
+    return xero_get_project_users(token=token)
+
+
 def xero_get_project_tasks(project_id, token=None):
     token = token or xero_access_token()
     tasks = []
@@ -810,28 +841,17 @@ def xero_find_or_create_task(project_id, description, token=None):
 
 def xero_resolve_project_user(employee, token=None):
     """
-    Use the manager-selected mapping when available. Otherwise try a safe
-    exact-name match once and store it for future exports.
+    Return the explicitly selected Xero Staff Member ID.
+    We deliberately do not auto-match by name because JWS display names can
+    differ from the legal/name used in Xero (for example Shawn / William).
     """
     if employee.xero_project_user_id:
         return employee.xero_project_user_id
 
-    token = token or xero_access_token()
-    matches = [
-        u for u in xero_get_project_users(token=token)
-        if (u.get("name") or "").strip().casefold() == employee.name.strip().casefold()
-    ]
-    if len(matches) == 1:
-        employee.xero_project_user_id = matches[0].get("userId")
-        employee.xero_project_user_name = matches[0].get("name")
-        db.session.commit()
-        return employee.xero_project_user_id
-
     raise RuntimeError(
-        f"{employee.name} is not mapped to a Xero Projects user. "
-        "Open Employees and select their Xero Projects user."
+        f"{employee.name} is not mapped to a Xero Staff Member. "
+        "Open Employees and choose the correct Xero Staff Member."
     )
-
 
 def hhmm_minutes(start, finish):
     if not start or not finish:
@@ -1122,6 +1142,8 @@ def api_projects():
 @login_required
 def history():
     u = current_user()
+    if u.role == "manager" and not u.can_timesheet:
+        return redirect(url_for("management"))
     rows = Timesheet.query.filter_by(user_id=u.id).order_by(Timesheet.week_start.desc()).all()
     data = [{"id": r.id, "week_start": r.week_start, "status": r.status, "total": timesheet_total(r.id)} for r in rows]
     return render_template("history.html", user=u, rows=data)
@@ -1268,26 +1290,27 @@ def employees():
             db.session.commit()
             return redirect(url_for("employees"))
     rows = User.query.filter_by(role="employee").order_by(User.name).all()
-    xero_users = []
-    xero_users_error = None
+    xero_staff_members = []
+    xero_staff_error = None
     if xero_is_configured():
         try:
-            xero_users = sorted(
-                xero_get_project_users(),
+            xero_staff_members = sorted(
+                xero_get_project_staff_members(),
                 key=lambda item: (item.get("name") or "").casefold()
             )
         except Exception as exc:
-            xero_users_error = str(exc)
+            xero_staff_error = str(exc)
 
     return render_template(
         "employees.html",
         user=u,
         rows=rows,
-        xero_users=xero_users,
-        xero_users_error=xero_users_error,
+        xero_staff_members=xero_staff_members,
+        xero_staff_error=xero_staff_error,
     )
 
 @app.post("/employees/<int:uid>/xero-user")
+@app.post("/employees/<int:uid>/xero-staff-member")
 @manager_required
 def employee_xero_user(uid):
     employee = db.session.get(User, uid)
@@ -1299,21 +1322,21 @@ def employee_xero_user(uid):
         employee.xero_project_user_id = None
         employee.xero_project_user_name = None
         db.session.commit()
-        flash(f"Cleared Xero Projects user mapping for {employee.name}.", "success")
+        flash(f"Cleared Xero Staff Member mapping for {employee.name}.", "success")
         return redirect(url_for("employees"))
 
     try:
-        xero_users = xero_get_project_users()
-        match = next((u for u in xero_users if u.get("userId") == selected_id), None)
+        xero_staff_members = xero_get_project_staff_members()
+        match = next((u for u in xero_staff_members if u.get("userId") == selected_id), None)
         if not match:
-            raise RuntimeError("That Xero Projects user could not be found.")
+            raise RuntimeError("That Xero Staff Member could not be found.")
         employee.xero_project_user_id = selected_id
         employee.xero_project_user_name = match.get("name")
         db.session.commit()
-        flash(f"{employee.name} mapped to Xero Projects user {match.get('name')}.", "success")
+        flash(f"{employee.name} mapped to Xero Staff Member {match.get('name')}.", "success")
     except Exception as exc:
         db.session.rollback()
-        flash(f"Could not save Xero user mapping: {exc}", "error")
+        flash(f"Could not save Xero Staff Member mapping: {exc}", "error")
 
     return redirect(url_for("employees"))
 
@@ -1530,16 +1553,17 @@ def settings_admin_add():
         password_hash=generate_password_hash(password),
         role="manager",
         active=True,
-        normal_hours=40,
+        normal_hours=0,
         basic_rate=0,
-        ot1_start=40,
+        ot1_start=0,
         ot1_rate=0,
         ot2_start=None,
         ot2_rate=0,
-        standard_day_hours=8,
-        mon_thu_hours=8.5,
-        friday_hours=6,
+        standard_day_hours=0,
+        mon_thu_hours=0,
+        friday_hours=0,
         is_primary_admin=False,
+        can_timesheet=False,
     )
     db.session.add(admin)
     db.session.commit()

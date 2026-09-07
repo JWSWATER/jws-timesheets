@@ -3,8 +3,10 @@
   <aside class="sidebar">
     <div class="brand"><img src="/static/assets/jws-water-logo.png" alt="JWS Water"></div>
     <nav class="nav">
+      {% if user.can_timesheet %}
       <a href="/dashboard">▣ My Timesheet</a>
       <a href="/history">◷ History</a>
+      {% endif %}
       {% if user.role=="manager" %}
         <div class="spacer"></div>
         <a href="/management">👥 Manager View</a>
@@ -19,12 +21,12 @@
   </aside>
   <main class="main">
     <header class="topbar">
-      <div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ user.role|title }}</div></div>
+      <div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ "Primary Admin" if user.is_primary_admin else ("Administrator" if user.role=="manager" and not user.can_timesheet else user.role|title) }}</div></div>
     </header>
     <section class="content">
       <h1>Employees</h1>
-      {% if xero_users_error %}
-      <div class="card panel"><div class="error">Could not load Xero Projects users: {{ xero_users_error }}</div></div>
+      {% if xero_staff_error %}
+      <div class="card panel"><div class="error">Could not load Xero Staff Members: {{ xero_staff_error }}</div></div>
       {% endif %}
       <div class="card panel">
         {% with messages=get_flashed_messages() %}
@@ -48,8 +50,9 @@
         </form>
       </div>
       <div class="card panel">
+        <p class="muted xero-mapping-help"><b>Xero Staff Member:</b> choose the person exactly as they appear in Xero's <b>Staff member</b> field when adding project time. The JWS employee name does not need to match.</p>
         <table>
-          <tr><th>Name</th><th>Username</th><th>Xero Payroll ID</th><th>Normal</th><th>Mon–Thu</th><th>Friday</th><th>OT1</th><th>OT2</th><th>Xero Projects user</th><th>Status</th><th></th></tr>
+          <tr><th>Name</th><th>Username</th><th>Xero Payroll ID / Employee No.</th><th>Normal</th><th>Mon–Thu</th><th>Friday</th><th>OT1</th><th>OT2</th><th>Xero Staff Member</th><th>Status</th><th></th></tr>
           {% for r in rows %}
           <tr>
             <td>{{r.name}}</td>
@@ -67,13 +70,13 @@
             <td>{{r.ot1_start}} / £{{r.ot1_rate}}</td>
             <td>{{r.ot2_start or "—"}} / £{{r.ot2_rate}}</td>
             <td>
-              {% if xero_users %}
-              <form method="post" action="/employees/{{r.id}}/xero-user" class="xero-user-form">
+              {% if xero_staff_members %}
+              <form method="post" action="/employees/{{r.id}}/xero-staff-member" class="xero-user-form">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <select name="xero_project_user_id">
-                  <option value="">Not mapped</option>
-                  {% for xu in xero_users %}
-                  <option value="{{ xu.userId }}" {% if r.xero_project_user_id==xu.userId %}selected{% endif %}>{{ xu.name }}</option>
+                  <option value="">Choose staff member</option>
+                  {% for xs in xero_staff_members %}
+                  <option value="{{ xs.userId }}" {% if r.xero_project_user_id==xs.userId %}selected{% endif %}>{{ xs.name }}{% if xs.email %} — {{ xs.email }}{% endif %}</option>
                   {% endfor %}
                 </select>
                 <button class="btn secondary" type="submit">Save</button>

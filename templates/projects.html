@@ -3,8 +3,10 @@
   <aside class="sidebar">
     <div class="brand"><img src="/static/assets/jws-water-logo.png" alt="JWS Water"></div>
     <nav class="nav">
+      {% if user.can_timesheet %}
       <a href="/dashboard">▣ My Timesheet</a>
       <a href="/history">◷ History</a>
+      {% endif %}
       <div class="spacer"></div>
       <a href="/management">👥 Manager View</a>
       <a href="/employees">👤 Employees</a>

@@ -3,8 +3,10 @@
   <aside class="sidebar">
     <div class="brand"><img src="/static/assets/jws-water-logo.png" alt="JWS Water"></div>
     <nav class="nav">
+      {% if user.can_timesheet %}
       <a href="/dashboard">▣ My Timesheet</a>
       <a href="/history">◷ History</a>
+      {% endif %}
       <div class="spacer"></div>
       <a href="/management">👥 Manager View</a>
       <a href="/employees">👤 Employees</a>
@@ -93,6 +95,7 @@
           <p class="muted">
             The Primary Admin account is permanently protected. Additional admins can use management functions,
             but only the Primary Admin can add, disable, enable or remove administrator accounts.
+            Additional admins do not have a personal timesheet or employee pay/overtime rates.
           </p>
 
           <div class="admin-list">
@@ -136,7 +139,7 @@
             <label>Temporary password<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
             <button class="btn primary" type="submit">Add Admin User</button>
           </form>
-          <p class="muted">The new admin can use Change Password after signing in.</p>
+          <p class="muted">The new admin can use Change Password after signing in. They will open directly into Manager View and will not have My Timesheet or pay-rate settings.</p>
           {% else %}
           <div class="settings-help">
             Only the Primary Admin can create, disable or remove admin accounts.
