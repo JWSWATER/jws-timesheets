@@ -953,17 +953,41 @@ def xero_find_or_create_task(project_id, description, token=None):
 
 def xero_resolve_project_user(employee, token=None):
     """
-    Return the explicitly selected Xero Staff Member ID.
-    We deliberately do not auto-match by name because JWS display names can
-    differ from the legal/name used in Xero (for example Shawn / William).
-    """
-    if employee.xero_project_user_id:
-        return employee.xero_project_user_id
+    Xero's own UI can display a wider 'Staff member' list, but the public
+    Projects API only accepts userIds returned by /projectsusers.
 
-    raise RuntimeError(
-        f"{employee.name} is not mapped to a Xero Staff Member. "
-        "Open Employees and choose the correct Xero Staff Member."
-    )
+    Keep the broader staff selection in JWS for identification, but validate
+    the selected person before attempting to create project time.
+    """
+    if not employee.xero_project_user_id:
+        raise RuntimeError(
+            f"{employee.name} is not mapped to a Xero Staff Member. "
+            "Open Employees and choose the correct Xero Staff Member."
+        )
+
+    token = token or xero_access_token()
+    project_users = xero_get_project_users(token=token)
+    eligible = {
+        (item.get("userId") or "").strip(): item
+        for item in project_users
+        if (item.get("userId") or "").strip()
+    }
+
+    if employee.xero_project_user_id not in eligible:
+        selected_name = employee.xero_project_user_name or employee.name
+        raise RuntimeError(
+            f"{selected_name} is visible as a Xero Staff Member but is not currently "
+            "an active Xero Projects user. In Xero, give this person Projects -> "
+            "Limited access, then retry. No additional accounting access is required."
+        )
+
+    # Refresh the stored display name from Xero Projects when available.
+    matched = eligible[employee.xero_project_user_id]
+    if matched.get("name") and matched.get("name") != employee.xero_project_user_name:
+        employee.xero_project_user_name = matched.get("name")
+        db.session.commit()
+
+    return employee.xero_project_user_id
 
 def hhmm_minutes(start, finish):
     if not start or not finish:
