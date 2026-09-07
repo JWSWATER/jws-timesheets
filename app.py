@@ -533,6 +533,7 @@ def save_timesheet():
 
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 XERO_PROJECTS_BASE_URL = "https://api.xero.com/projects.xro/2.0"
+XERO_ACCOUNTING_BASE_URL = "https://api.xero.com/api.xro/2.0"
 XERO_PROJECTS_URL = f"{XERO_PROJECTS_BASE_URL}/Projects"
 
 def _valid_email(value):
@@ -676,9 +677,15 @@ def xero_access_token():
         raise RuntimeError("Xero Client ID and Client Secret have not been configured in Railway.")
 
     basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    # The connection is authorised for Projects plus Accounting Settings.
+    # accounting.settings.read is required for GET /Users.
+    requested_scopes = os.environ.get(
+        "XERO_SCOPES",
+        "projects accounting.settings.read"
+    ).strip()
     body = urlencode({
         "grant_type": "client_credentials",
-        "scope": "projects"
+        "scope": requested_scopes
     }).encode("utf-8")
     req = Request(
         XERO_TOKEN_URL,
@@ -703,6 +710,69 @@ def xero_access_token():
     if not token:
         raise RuntimeError("Xero did not return an access token.")
     return token
+
+
+def xero_accounting_request(method, path, token=None, query=None):
+    """Call the Xero Accounting API for this single-organisation Custom Connection."""
+    token = token or xero_access_token()
+    url = f"{XERO_ACCOUNTING_BASE_URL}{path}"
+    if query:
+        url += "?" + urlencode(query)
+
+    req = Request(
+        url,
+        method=method.upper(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(req, timeout=35) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else None
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Xero Accounting API failed ({exc.code}) on {method.upper()} {path}: {detail[:700]}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not contact Xero Accounting API: {exc.reason}") from exc
+
+
+def xero_get_organisation_users(token=None):
+    """
+    Retrieve Xero organisation Users and normalise them into the same shape
+    used by the staff-member dropdown.
+
+    Accounting API fields:
+      UserID, FirstName, LastName, EmailAddress
+    """
+    token = token or xero_access_token()
+    payload = xero_accounting_request("GET", "/Users", token=token) or {}
+    result = []
+
+    for item in payload.get("Users") or []:
+        user_id = (item.get("UserID") or "").strip()
+        first = (item.get("FirstName") or "").strip()
+        last = (item.get("LastName") or "").strip()
+        name = " ".join(part for part in (first, last) if part).strip()
+        email = (item.get("EmailAddress") or "").strip()
+
+        if not user_id:
+            continue
+        if not name:
+            name = email or user_id
+
+        result.append({
+            "userId": user_id,
+            "name": name,
+            "email": email,
+            "source": "organisation",
+        })
+
+    return result
+
 
 def xero_api_request(method, path, token=None, body=None, query=None, idempotency_key=None):
     """Call the Xero Projects API for this Custom Connection."""
@@ -760,11 +830,50 @@ def xero_get_project_users(token=None):
 
 def xero_get_project_staff_members(token=None):
     """
-    Xero's Projects API names this resource ProjectsUsers, while the Xero
-    screen labels the selectable person as Staff member. These records provide
-    the userId required when creating a Projects time entry.
+    Build the Staff Member list shown in JWS Timesheets.
+
+    Primary source:
+      Accounting API /Users (accounting.settings.read)
+
+    Secondary source:
+      Projects API /ProjectsUsers
+
+    Both expose Xero user identifiers. Results are merged and de-duplicated,
+    giving us a broader list than /ProjectsUsers alone.
     """
-    return xero_get_project_users(token=token)
+    token = token or xero_access_token()
+    merged = {}
+
+    # Start with the organisation's Xero users.
+    for item in xero_get_organisation_users(token=token):
+        user_id = (item.get("userId") or "").strip()
+        if user_id:
+            merged[user_id] = item
+
+    # Merge Projects users as well. If the same user exists in both sources,
+    # retain whichever source gives us the better name/email details.
+    try:
+        project_users = xero_get_project_users(token=token)
+    except Exception:
+        project_users = []
+
+    for item in project_users:
+        user_id = (item.get("userId") or "").strip()
+        if not user_id:
+            continue
+
+        current = merged.get(user_id, {})
+        project_name = (item.get("name") or "").strip()
+        project_email = (item.get("email") or "").strip()
+
+        merged[user_id] = {
+            "userId": user_id,
+            "name": project_name or current.get("name") or project_email or user_id,
+            "email": project_email or current.get("email") or "",
+            "source": "projects" if not current else "organisation+projects",
+        }
+
+    return list(merged.values())
 
 
 def xero_get_project_tasks(project_id, token=None):
@@ -1299,7 +1408,11 @@ def employees():
                 key=lambda item: (item.get("name") or "").casefold()
             )
         except Exception as exc:
-            xero_staff_error = str(exc)
+            xero_staff_error = (
+                f"{exc} "
+                "Confirm the Custom Connection includes accounting.settings.read "
+                "and has been re-authorised."
+            )
 
     return render_template(
         "employees.html",
