@@ -534,7 +534,7 @@ def save_timesheet():
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 XERO_PROJECTS_BASE_URL = "https://api.xero.com/projects.xro/2.0"
 XERO_ACCOUNTING_BASE_URL = "https://api.xero.com/api.xro/2.0"
-XERO_PROJECTS_URL = f"{XERO_PROJECTS_BASE_URL}/projects"
+XERO_PROJECTS_URL = f"{XERO_PROJECTS_BASE_URL}/Projects"
 
 def _valid_email(value):
     value = (value or "").strip()
@@ -815,7 +815,7 @@ def xero_get_project_users(token=None):
     while True:
         payload = xero_api_request(
             "GET",
-            "/projectsusers",
+            "/ProjectsUsers",
             token=token,
             query={"page": page, "pageSize": 500},
         ) or {}
@@ -881,7 +881,7 @@ def xero_get_project(project_id, token=None):
     token = token or xero_access_token()
     return xero_api_request(
         "GET",
-        f"/projects/{project_id}",
+        f"/Projects/{project_id}",
         token=token,
     )
 
@@ -891,7 +891,7 @@ def xero_get_project_task(project_id, task_id, token=None):
     token = token or xero_access_token()
     return xero_api_request(
         "GET",
-        f"/projects/{project_id}/tasks/{task_id}",
+        f"/Projects/{project_id}/Tasks/{task_id}",
         token=token,
     )
 
@@ -903,7 +903,7 @@ def xero_get_project_tasks(project_id, token=None):
     while True:
         payload = xero_api_request(
             "GET",
-            f"/projects/{project_id}/tasks",
+            f"/Projects/{project_id}/Tasks",
             token=token,
             query={"page": page, "pageSize": 500},
         ) or {}
@@ -961,11 +961,11 @@ def xero_find_or_create_task(project_id, description, token=None):
     }
     return xero_api_request(
         "POST",
-        f"/projects/{project_id}/tasks",
+        f"/Projects/{project_id}/Tasks",
         token=token,
         body=body,
         idempotency_key=_xero_idempotency(
-            "task-v2",
+            "task-v3",
             f"{project_id}|{json.dumps(body, sort_keys=True, separators=(',', ':'))}"
         ),
     )
@@ -1178,11 +1178,11 @@ def export_timesheet_to_xero_projects(ts):
             try:
                 created = xero_api_request(
                     "POST",
-                    f"/projects/{project_id}/time",
+                    f"/Projects/{project_id}/Time",
                     token=token,
                     body=payload,
                     idempotency_key=_xero_idempotency(
-                        "time-v3",
+                        "time-v4",
                         f"entry-{entry.id}|{project_id}|"
                         f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
                     ),
@@ -1443,6 +1443,7 @@ def timesheet_summary(tsid):
         project_entry_count=len(project_entries),
         xero_sent_count=xero_sent_count,
         xero_configured=xero_is_configured(),
+        xero_export_version="v4-official-paths",
     )
 
 @app.post("/timesheet/<int:tsid>/<action>")
@@ -1486,6 +1487,11 @@ def timesheet_export_xero(tsid):
     ts = db.session.get(Timesheet, tsid)
     if not ts:
         return "Not found", 404
+
+    # Clear any previous Xero error so this retry always reports the current result.
+    ts.xero_projects_export_error = None
+    db.session.commit()
+
     try:
         sent = export_timesheet_to_xero_projects(ts)
         flash(
