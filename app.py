@@ -4,11 +4,16 @@ import base64
 import json
 import hashlib
 import math
+import re
+import smtplib
+import ssl
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from datetime import datetime, date, timedelta
 from functools import wraps
+from email.message import EmailMessage
+from email.utils import parseaddr
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
 from flask_sqlalchemy import SQLAlchemy
@@ -57,6 +62,8 @@ class User(db.Model):
     friday_hours = db.Column(db.Float, nullable=False, default=6)
     xero_project_user_id = db.Column(db.String(120), nullable=True, index=True)
     xero_project_user_name = db.Column(db.String(200), nullable=True)
+    xero_payroll_id = db.Column(db.String(120), nullable=True, index=True)
+    is_primary_admin = db.Column(db.Boolean, nullable=False, default=False)
 
 class Project(db.Model):
     __tablename__ = "projects"
@@ -148,6 +155,16 @@ def init_db():
                 conn.exec_driver_sql(
                     "ALTER TABLE users ADD COLUMN xero_project_user_name VARCHAR(200)"
                 )
+        if "xero_payroll_id" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN xero_payroll_id VARCHAR(120)"
+                )
+        if "is_primary_admin" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN is_primary_admin BOOLEAN NOT NULL DEFAULT FALSE"
+                )
 
         entry_columns = {c["name"] for c in inspector.get_columns("entries")}
         if "xero_task_id" not in entry_columns:
@@ -193,7 +210,8 @@ def init_db():
             name=os.environ.get("JWS_ADMIN_NAME", "Jonathon Stevenson"),
             username=admin_username,
             password_hash=generate_password_hash(admin_password),
-            role="manager", normal_hours=40, ot1_start=40, ot2_start=50
+            role="manager", normal_hours=40, ot1_start=40, ot2_start=50,
+            is_primary_admin=True
         ))
 
         if not is_live:
@@ -212,6 +230,28 @@ def init_db():
             ("26102","26102 - Pumping Station Survey")
         ]:
             db.session.add(Project(external_id=ref, name=name, source="sample"))
+
+    # Protect the original JWS Admin account. On an existing database the
+    # configured JWS_ADMIN_USERNAME is preferred; otherwise the oldest manager
+    # becomes the primary admin. This runs only if no primary is already set.
+    db.session.flush()
+    try:
+        primary = User.query.filter_by(role="manager", is_primary_admin=True).first()
+        if primary is None:
+            configured_username = os.environ.get("JWS_ADMIN_USERNAME", "admin").strip()
+            primary = User.query.filter(
+                User.role == "manager",
+                db.func.lower(User.username) == configured_username.lower(),
+            ).first()
+            if primary is None:
+                primary = User.query.filter_by(role="manager").order_by(User.id.asc()).first()
+            if primary:
+                primary.is_primary_admin = True
+                primary.active = True
+    except Exception:
+        db.session.rollback()
+        raise
+
     db.session.commit()
 
 def login_required(fn):
@@ -230,6 +270,20 @@ def manager_required(fn):
         u = db.session.get(User, session["user_id"])
         if not u or u.role != "manager":
             return redirect(url_for("dashboard"))
+        return fn(*a, **k)
+    return wrapped
+
+def primary_admin_required(fn):
+    @wraps(fn)
+    def wrapped(*a, **k):
+        if "user_id" not in session:
+            return redirect(url_for("login"))
+        u = db.session.get(User, session["user_id"])
+        if not u or u.role != "manager":
+            return redirect(url_for("dashboard"))
+        if not u.is_primary_admin:
+            flash("Only the Primary Admin can manage administrator accounts.", "error")
+            return redirect(url_for("settings"))
         return fn(*a, **k)
     return wrapped
 
@@ -433,12 +487,162 @@ def save_timesheet():
         ts.submitted_at = datetime.utcnow()
 
     db.session.commit()
-    return jsonify({"ok": True})
+
+    notification_warning = None
+    if data.get("submit"):
+        try:
+            sent_count = notify_timesheet_submitted(ts)
+            app_setting_set("submission_email_last_error", "")
+            app_setting_set("submission_email_last_sent_at", datetime.utcnow().isoformat())
+            app_setting_set("submission_email_last_sent_count", str(sent_count))
+            db.session.commit()
+        except Exception as exc:
+            # The timesheet remains submitted even if email is temporarily unavailable.
+            db.session.rollback()
+            try:
+                app_setting_set("submission_email_last_error", str(exc)[:1200])
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            notification_warning = str(exc)
+
+    return jsonify({"ok": True, "notification_warning": notification_warning})
 
 
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 XERO_PROJECTS_BASE_URL = "https://api.xero.com/projects.xro/2.0"
 XERO_PROJECTS_URL = f"{XERO_PROJECTS_BASE_URL}/Projects"
+
+def _valid_email(value):
+    value = (value or "").strip()
+    parsed = parseaddr(value)[1]
+    return bool(parsed and "@" in parsed and "." in parsed.rsplit("@", 1)[-1])
+
+
+def get_submission_notification_emails():
+    raw = app_setting_get("submission_notification_emails", "[]")
+    try:
+        values = json.loads(raw)
+        if not isinstance(values, list):
+            values = []
+    except Exception:
+        # Backward-friendly fallback for a comma/newline-separated setting.
+        values = re.split(r"[,;\n]+", raw or "")
+
+    result = []
+    seen = set()
+    for value in values:
+        email = (str(value) or "").strip()
+        key = email.casefold()
+        if email and _valid_email(email) and key not in seen:
+            seen.add(key)
+            result.append(email)
+    return result
+
+
+def set_submission_notification_emails(values):
+    clean = []
+    seen = set()
+    for value in values:
+        email = (value or "").strip()
+        key = email.casefold()
+        if email and _valid_email(email) and key not in seen:
+            seen.add(key)
+            clean.append(email)
+    app_setting_set("submission_notification_emails", json.dumps(clean))
+    return clean
+
+
+def smtp_is_configured():
+    return bool(
+        os.environ.get("SMTP_HOST", "").strip()
+        and os.environ.get("SMTP_FROM_EMAIL", "").strip()
+    )
+
+
+def send_smtp_message(to_email, subject, text_body):
+    host = os.environ.get("SMTP_HOST", "").strip()
+    if not host:
+        raise RuntimeError("SMTP_HOST is not configured in Railway.")
+
+    from_email = os.environ.get("SMTP_FROM_EMAIL", "").strip()
+    if not from_email:
+        raise RuntimeError("SMTP_FROM_EMAIL is not configured in Railway.")
+
+    username = os.environ.get("SMTP_USERNAME", "").strip()
+    password = os.environ.get("SMTP_PASSWORD", "")
+    use_ssl = os.environ.get("SMTP_USE_SSL", "false").strip().lower() in ("1", "true", "yes", "on")
+    use_tls = os.environ.get("SMTP_USE_TLS", "true").strip().lower() in ("1", "true", "yes", "on")
+
+    try:
+        default_port = 465 if use_ssl else 587
+        port = int(os.environ.get("SMTP_PORT", str(default_port)))
+    except ValueError:
+        port = 465 if use_ssl else 587
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.set_content(text_body)
+
+    if use_ssl:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, timeout=25, context=context) as smtp:
+            if username:
+                smtp.login(username, password)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=25) as smtp:
+            smtp.ehlo()
+            if use_tls:
+                context = ssl.create_default_context()
+                smtp.starttls(context=context)
+                smtp.ehlo()
+            if username:
+                smtp.login(username, password)
+            smtp.send_message(msg)
+
+
+def notify_timesheet_submitted(ts):
+    recipients = get_submission_notification_emails()
+    if not recipients:
+        return 0
+
+    if not smtp_is_configured():
+        raise RuntimeError(
+            "Submission notification recipients are configured, but SMTP email "
+            "has not been configured in Railway."
+        )
+
+    employee = ts.user
+    total = timesheet_total(ts.id)
+    manager_url = request.url_root.rstrip("/") + url_for("management")
+    subject = f"Timesheet submitted - {employee.name} - week commencing {ts.week_start}"
+    body = (
+        f"A new JWS Timesheet has been submitted.\n\n"
+        f"Employee: {employee.name}\n"
+        f"Week commencing: {ts.week_start}\n"
+        f"Total paid hours: {total:.2f}\n"
+        f"Status: Submitted - awaiting approval\n\n"
+        f"Open Manager View:\n{manager_url}\n\n"
+        f"JWS Timesheets"
+    )
+
+    errors = []
+    sent = 0
+    # Send separate copies so recipient addresses are not exposed to one another.
+    for recipient in recipients:
+        try:
+            send_smtp_message(recipient, subject, body)
+            sent += 1
+        except Exception as exc:
+            errors.append(f"{recipient}: {exc}")
+
+    if errors:
+        raise RuntimeError("; ".join(errors)[:1200])
+    return sent
+
 
 def xero_is_configured():
     return bool(os.environ.get("XERO_CLIENT_ID") and os.environ.get("XERO_CLIENT_SECRET"))
@@ -1059,6 +1263,7 @@ def employees():
                 standard_day_hours=8,
                 mon_thu_hours=float(f.get("mon_thu_hours") or 8.5),
                 friday_hours=float(f.get("friday_hours") or 6),
+                xero_payroll_id=(f.get("xero_payroll_id") or "").strip() or None,
             ))
             db.session.commit()
             return redirect(url_for("employees"))
@@ -1110,6 +1315,32 @@ def employee_xero_user(uid):
         db.session.rollback()
         flash(f"Could not save Xero user mapping: {exc}", "error")
 
+    return redirect(url_for("employees"))
+
+
+@app.post("/employees/<int:uid>/payroll-id")
+@manager_required
+def employee_payroll_id(uid):
+    employee = db.session.get(User, uid)
+    if not employee or employee.role != "employee":
+        return "Not found", 404
+
+    payroll_id = (request.form.get("xero_payroll_id") or "").strip()
+    if payroll_id:
+        duplicate = User.query.filter(
+            User.id != employee.id,
+            db.func.lower(User.xero_payroll_id) == payroll_id.lower(),
+        ).first()
+        if duplicate:
+            flash(
+                f"Payroll ID {payroll_id} is already assigned to {duplicate.name}.",
+                "error",
+            )
+            return redirect(url_for("employees"))
+
+    employee.xero_payroll_id = payroll_id or None
+    db.session.commit()
+    flash(f"Xero Payroll ID saved for {employee.name}.", "success")
     return redirect(url_for("employees"))
 
 
@@ -1185,11 +1416,187 @@ def change_password():
 @app.get("/settings")
 @manager_required
 def settings():
+    admins = User.query.filter_by(role="manager").order_by(User.name).all()
     return render_template(
         "settings.html",
         user=current_user(),
         xero_configured=xero_is_configured(),
+        notification_emails=get_submission_notification_emails(),
+        smtp_configured=smtp_is_configured(),
+        submission_email_last_error=app_setting_get("submission_email_last_error", ""),
+        submission_email_last_sent_at=app_setting_get("submission_email_last_sent_at", ""),
+        admins=admins,
     )
+
+
+@app.post("/settings/notification-emails/add")
+@manager_required
+def settings_notification_email_add():
+    email = (request.form.get("email") or "").strip()
+    if not _valid_email(email):
+        flash("Enter a valid email address.", "error")
+        return redirect(url_for("settings"))
+
+    emails = get_submission_notification_emails()
+    if email.casefold() not in {e.casefold() for e in emails}:
+        emails.append(email)
+        set_submission_notification_emails(emails)
+        db.session.commit()
+        flash(f"{email} added to timesheet submission notifications.", "success")
+    else:
+        flash(f"{email} is already on the notification list.", "error")
+    return redirect(url_for("settings"))
+
+
+@app.post("/settings/notification-emails/remove")
+@manager_required
+def settings_notification_email_remove():
+    email = (request.form.get("email") or "").strip()
+    emails = [
+        e for e in get_submission_notification_emails()
+        if e.casefold() != email.casefold()
+    ]
+    set_submission_notification_emails(emails)
+    db.session.commit()
+    flash(f"{email} removed from timesheet submission notifications.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.post("/settings/notification-emails/test")
+@manager_required
+def settings_notification_email_test():
+    recipients = get_submission_notification_emails()
+    if not recipients:
+        flash("Add at least one notification email address first.", "error")
+        return redirect(url_for("settings"))
+
+    if not smtp_is_configured():
+        flash(
+            "SMTP is not configured in Railway yet. Add the SMTP variables shown on this page.",
+            "error",
+        )
+        return redirect(url_for("settings"))
+
+    sender = current_user()
+    subject = "JWS Timesheets - test submission notification"
+    body = (
+        "This is a test email from JWS Timesheets.\n\n"
+        f"Sent by: {sender.name}\n"
+        "If you received this, timesheet submission email notifications are working.\n"
+    )
+
+    errors = []
+    sent = 0
+    for recipient in recipients:
+        try:
+            send_smtp_message(recipient, subject, body)
+            sent += 1
+        except Exception as exc:
+            errors.append(f"{recipient}: {exc}")
+
+    if errors:
+        app_setting_set("submission_email_last_error", "; ".join(errors)[:1200])
+        db.session.commit()
+        flash(f"Test email had an error: {'; '.join(errors)[:500]}", "error")
+    else:
+        app_setting_set("submission_email_last_error", "")
+        app_setting_set("submission_email_last_sent_at", datetime.utcnow().isoformat())
+        app_setting_set("submission_email_last_sent_count", str(sent))
+        db.session.commit()
+        flash(f"Test notification sent to {sent} recipient(s).", "success")
+    return redirect(url_for("settings"))
+
+
+@app.post("/settings/admins/add")
+@primary_admin_required
+def settings_admin_add():
+    name = (request.form.get("name") or "").strip()
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+
+    if not name or not username:
+        flash("Admin name and username are required.", "error")
+        return redirect(url_for("settings"))
+    if len(password) < 8:
+        flash("Admin password must be at least 8 characters.", "error")
+        return redirect(url_for("settings"))
+    if User.query.filter(db.func.lower(User.username) == username.lower()).first():
+        flash("That username already exists.", "error")
+        return redirect(url_for("settings"))
+
+    admin = User(
+        name=name,
+        username=username,
+        password_hash=generate_password_hash(password),
+        role="manager",
+        active=True,
+        normal_hours=40,
+        basic_rate=0,
+        ot1_start=40,
+        ot1_rate=0,
+        ot2_start=None,
+        ot2_rate=0,
+        standard_day_hours=8,
+        mon_thu_hours=8.5,
+        friday_hours=6,
+        is_primary_admin=False,
+    )
+    db.session.add(admin)
+    db.session.commit()
+    flash(f"Admin user {name} created.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.post("/settings/admins/<int:uid>/toggle")
+@primary_admin_required
+def settings_admin_toggle(uid):
+    admin = db.session.get(User, uid)
+    if not admin or admin.role != "manager":
+        return "Not found", 404
+
+    if admin.is_primary_admin:
+        flash("The Primary Admin account is protected and cannot be disabled.", "error")
+        return redirect(url_for("settings"))
+
+    admin.active = not admin.active
+    db.session.commit()
+    flash(
+        f"{admin.name} {'enabled' if admin.active else 'disabled'}.",
+        "success",
+    )
+    return redirect(url_for("settings"))
+
+
+@app.post("/settings/admins/<int:uid>/remove")
+@primary_admin_required
+def settings_admin_remove(uid):
+    admin = db.session.get(User, uid)
+    if not admin or admin.role != "manager":
+        return "Not found", 404
+
+    if admin.is_primary_admin:
+        flash("The Primary Admin account is protected and cannot be removed.", "error")
+        return redirect(url_for("settings"))
+
+    # Preserve audit/history integrity. Additional admins with no timesheet
+    # records can be removed permanently. If an admin ever has a timesheet,
+    # keep the historical record and disable the login instead.
+    has_timesheets = Timesheet.query.filter_by(user_id=admin.id).first() is not None
+    if has_timesheets:
+        admin.active = False
+        db.session.commit()
+        flash(
+            f"{admin.name} has historical timesheet records, so the account was disabled "
+            "rather than deleted to preserve the audit trail.",
+            "error",
+        )
+        return redirect(url_for("settings"))
+
+    name = admin.name
+    db.session.delete(admin)
+    db.session.commit()
+    flash(f"Admin account {name} permanently removed.", "success")
+    return redirect(url_for("settings"))
 
 with app.app_context():
     init_db()

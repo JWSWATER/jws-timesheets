@@ -38,6 +38,7 @@
           <input name="normal_hours" type="number" step=".25" value="40" placeholder="Normal weekly hours">
 <input name="mon_thu_hours" type="number" step=".25" min="0" value="8.5" placeholder="Mon–Thu normal hours">
 <input name="friday_hours" type="number" step=".25" min="0" value="6" placeholder="Friday normal hours">
+<input name="xero_payroll_id" placeholder="Xero Payroll ID / employee number">
           <input name="basic_rate" type="number" step=".01" placeholder="Basic rate">
           <input name="ot1_start" type="number" step=".25" value="40" placeholder="OT1 starts after">
           <input name="ot1_rate" type="number" step=".01" placeholder="OT1 rate">
@@ -48,11 +49,18 @@
       </div>
       <div class="card panel">
         <table>
-          <tr><th>Name</th><th>Username</th><th>Normal</th><th>Mon–Thu</th><th>Friday</th><th>OT1</th><th>OT2</th><th>Xero Projects user</th><th>Status</th><th></th></tr>
+          <tr><th>Name</th><th>Username</th><th>Xero Payroll ID</th><th>Normal</th><th>Mon–Thu</th><th>Friday</th><th>OT1</th><th>OT2</th><th>Xero Projects user</th><th>Status</th><th></th></tr>
           {% for r in rows %}
           <tr>
             <td>{{r.name}}</td>
             <td>{{r.username}}</td>
+            <td>
+              <form method="post" action="/employees/{{r.id}}/payroll-id" class="payroll-id-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input name="xero_payroll_id" value="{{ r.xero_payroll_id or '' }}" placeholder="Payroll ID">
+                <button class="btn secondary" type="submit">Save</button>
+              </form>
+            </td>
             <td>{{r.normal_hours}}</td>
             <td>{{ "%.2f"|format(r.mon_thu_hours or 8.5) }} hrs</td>
             <td>{{ "%.2f"|format(r.friday_hours or 6) }} hrs</td>

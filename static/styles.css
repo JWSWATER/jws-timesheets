@@ -36,3 +36,47 @@
 .xero-user-form select{min-width:160px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#fff}
 .xero-export-panel{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
 @media(max-width:900px){.xero-user-form{min-width:210px}.xero-user-form select{min-width:130px}}
+
+/* Settings: notification recipients and administrator users */
+.settings-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px;align-items:start}
+.settings-grid .card:last-child{grid-column:1/-1}
+.settings-grid h2{margin-top:0}
+.setting-form{display:grid;gap:12px;margin-top:16px}
+.setting-form label{font-size:13px;font-weight:700;color:var(--muted)}
+.setting-form input{display:block;width:100%;margin-top:5px;padding:10px 11px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.inline-setting-form{grid-template-columns:minmax(0,1fr) auto;align-items:end}
+.inline-setting-form input{margin-top:0}
+.recipient-list,.admin-list{display:grid;gap:8px;margin:14px 0}
+.recipient-row,.admin-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.recipient-row:last-child,.admin-row:last-child{border-bottom:0}
+.smtp-status{margin-top:16px}
+.settings-help{margin:10px 0;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:#f8fafc;font-size:12px;line-height:1.6}
+.settings-error{margin:10px 0}
+.payroll-id-form{display:flex;gap:6px;align-items:center;min-width:190px}
+.payroll-id-form input{width:110px;padding:7px 8px;border:1px solid var(--line);border-radius:8px;background:#fff}
+@media(max-width:900px){
+  .settings-grid{grid-template-columns:1fr}
+  .settings-grid .card:last-child{grid-column:auto}
+}
+@media(max-width:600px){
+  .inline-setting-form{grid-template-columns:1fr}
+  .recipient-row,.admin-row{align-items:flex-start}
+}
+
+/* Protected Primary Admin */
+.primary-admin-badge{
+  display:inline-block;
+  margin-left:7px;
+  padding:3px 7px;
+  border:1px solid var(--line);
+  border-radius:999px;
+  font-size:10px;
+  font-weight:700;
+  vertical-align:middle;
+  background:#f8fafc;
+}
+.admin-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}
+.admin-actions form{margin:0}
+@media(max-width:600px){
+  .admin-actions{justify-content:flex-start;margin-top:8px}
+}

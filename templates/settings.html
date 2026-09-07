@@ -21,14 +21,140 @@
     </header>
     <section class="content">
       <h1>Settings</h1>
-      <div class="card panel">
-        <div class="notice">
-          <b>Xero Projects connection:</b>
-          {% if xero_configured %}
-            credentials are configured. Go to <a href="/projects"><b>Projects</b></a> and select <b>Sync from Xero</b>.
+      {% with messages=get_flashed_messages() %}
+        {% if messages %}
+          <div class="card panel"><div class="notice">{{ messages[0] }}</div></div>
+        {% endif %}
+      {% endwith %}
+
+      <div class="settings-grid">
+        <div class="card panel">
+          <h2>Timesheet Submission Emails</h2>
+          <p class="muted">Everyone on this list receives an email whenever an employee submits a timesheet for approval.</p>
+
+          {% if notification_emails %}
+            <div class="recipient-list">
+              {% for email in notification_emails %}
+              <div class="recipient-row">
+                <span>{{ email }}</span>
+                <form method="post" action="/settings/notification-emails/remove">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="email" value="{{ email }}">
+                  <button class="btn danger" type="submit">Remove</button>
+                </form>
+              </div>
+              {% endfor %}
+            </div>
           {% else %}
-            not configured. Add <b>XERO_CLIENT_ID</b> and <b>XERO_CLIENT_SECRET</b> to the Railway web service.
+            <p class="muted">No notification recipients added yet.</p>
           {% endif %}
+
+          <form method="post" action="/settings/notification-emails/add" class="setting-form inline-setting-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input name="email" type="email" placeholder="name@example.com" required>
+            <button class="btn primary" type="submit">Add Email</button>
+          </form>
+
+          <div class="smtp-status">
+            <b>Email service:</b>
+            {% if smtp_configured %}
+              Configured
+            {% else %}
+              Not configured
+            {% endif %}
+          </div>
+
+          {% if not smtp_configured %}
+          <div class="settings-help">
+            <b>Railway variables required:</b><br>
+            SMTP_HOST<br>
+            SMTP_PORT<br>
+            SMTP_USERNAME<br>
+            SMTP_PASSWORD<br>
+            SMTP_FROM_EMAIL<br>
+            SMTP_USE_TLS = true
+          </div>
+          {% endif %}
+
+          {% if submission_email_last_error %}
+            <div class="error settings-error"><b>Last email error:</b> {{ submission_email_last_error }}</div>
+          {% elif submission_email_last_sent_at %}
+            <p class="muted">Last successful email: {{ submission_email_last_sent_at[:19].replace("T", " ") }} UTC</p>
+          {% endif %}
+
+          <form method="post" action="/settings/notification-emails/test">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn secondary" type="submit">Send Test Email</button>
+          </form>
+        </div>
+
+        <div class="card panel">
+          <h2>Admin Users</h2>
+          <p class="muted">
+            The Primary Admin account is permanently protected. Additional admins can use management functions,
+            but only the Primary Admin can add, disable, enable or remove administrator accounts.
+          </p>
+
+          <div class="admin-list">
+            {% for admin in admins %}
+            <div class="admin-row">
+              <div>
+                <strong>{{ admin.name }}</strong>
+                {% if admin.is_primary_admin %}<span class="primary-admin-badge">Primary Admin · Protected</span>{% endif %}
+                <div class="muted">{{ admin.username }} · {{ "Active" if admin.active else "Disabled" }}</div>
+              </div>
+
+              <div class="admin-actions">
+                {% if admin.is_primary_admin %}
+                  <span class="muted">Cannot be disabled or removed</span>
+                {% elif user.is_primary_admin %}
+                  <form method="post" action="/settings/admins/{{admin.id}}/toggle">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button class="btn {{ 'danger' if admin.active else 'secondary' }}" type="submit">
+                      {{ "Disable" if admin.active else "Enable" }}
+                    </button>
+                  </form>
+                  <form method="post" action="/settings/admins/{{admin.id}}/remove"
+                        onsubmit="return confirm('Permanently remove {{ admin.name|e }} as an admin user?');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button class="btn danger" type="submit">Remove</button>
+                  </form>
+                {% else %}
+                  <span class="muted">Managed by Primary Admin</span>
+                {% endif %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+
+          {% if user.is_primary_admin %}
+          <h3>Add Admin User</h3>
+          <form method="post" action="/settings/admins/add" class="setting-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label>Name<input name="name" required placeholder="Accountant / bookkeeper name"></label>
+            <label>Username<input name="username" required autocomplete="off"></label>
+            <label>Temporary password<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
+            <button class="btn primary" type="submit">Add Admin User</button>
+          </form>
+          <p class="muted">The new admin can use Change Password after signing in.</p>
+          {% else %}
+          <div class="settings-help">
+            Only the Primary Admin can create, disable or remove admin accounts.
+          </div>
+          {% endif %}
+        </div>
+
+        <div class="card panel">
+          <h2>Xero</h2>
+          <div class="notice">
+            <b>Xero Projects connection:</b>
+            {% if xero_configured %}
+              credentials are configured.
+            {% else %}
+              not configured. Add <b>XERO_CLIENT_ID</b> and <b>XERO_CLIENT_SECRET</b> to Railway.
+            {% endif %}
+          </div>
+          <p class="muted">Employee Xero Payroll IDs are managed from the Employees page. Xero Projects users remain a separate one-time mapping.</p>
         </div>
       </div>
     </section>
