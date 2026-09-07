@@ -80,3 +80,8 @@
 @media(max-width:600px){
   .admin-actions{justify-content:flex-start;margin-top:8px}
 }
+
+/* Payroll basis controls */
+.employee-form select{padding:10px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.payroll-id-form select{width:95px;padding:7px 8px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.employee-form [hidden]{display:none!important}

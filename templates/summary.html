@@ -1,5 +1,5 @@
 {% extends "base.html" %}{% block body %}<div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/static/assets/jws-water-logo.png"></div><nav class="nav">
-<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a><div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a><div class="spacer"></div><a href="/change-password">🔒 Change Password</a><a href="/logout">↪ Logout</a></nav></aside>
+{% if user.can_timesheet %}<a href="/dashboard">▣ My Timesheet</a><a href="/history">◷ History</a>{% endif %}<div class="spacer"></div><a href="/management">👥 Manager View</a><a href="/employees">👤 Employees</a><a href="/projects">▦ Projects</a><a href="/settings">⚙ Settings</a><div class="spacer"></div><a href="/change-password">🔒 Change Password</a><a href="/logout">↪ Logout</a></nav></aside>
 <main class="main"><header class="topbar"><div><strong>Welcome, {{ user.name }}</strong><div class="muted">{{ "Primary Admin" if user.is_primary_admin else ("Administrator" if user.role=="manager" and not user.can_timesheet else user.role|title) }}</div></div></header><section class="content">
 <h1>Full Timesheet Summary</h1><p><b>{{ employee.name }}</b> · Week {{ ts.week_start }}</p><div class="card panel">
 <table><tr><th>Date</th><th>Start</th><th>Finish</th><th>Project</th><th>Description / Xero Task</th><th>Xero</th></tr>
@@ -32,11 +32,15 @@
 <b>Public Holiday:</b> {{"%.2f"|format(public_holiday_total)}} hrs ·
 <b>Paid Total:</b> {{"%.2f"|format(total)}} hrs
 </p>
+{% if payroll_basis == "hourly" %}
 <p>
 <b>Normal Worked:</b> {{"%.2f"|format(normal)}} hrs ·
 <b>OT1:</b> {{"%.2f"|format(ot1)}} hrs ·
 <b>OT2:</b> {{"%.2f"|format(ot2)}} hrs
 </p>
+{% else %}
+<p class="muted"><b>Payroll basis: Salaried.</b> Worked hours are retained for accountability and Xero Projects only; they do not change salary.</p>
+{% endif %}
 {% if ts.status=="approved" %}
 <div class="xero-export-panel">
   <p><b>Xero Projects:</b> {{ xero_sent_count }} of {{ project_entry_count }} project time entries sent.</p>
@@ -55,7 +59,7 @@
   <p>
     <b>Xero Payroll:</b>
     {% if payroll_exported %}
-      Export complete{% if payroll_timesheet_id %} · Payroll timesheet approved{% else %} · no worked-hours timesheet required{% endif %}.
+      Export complete{% if payroll_timesheet_id %} · Payroll timesheet approved{% elif payroll_basis == "salaried" %} · salaried worked hours not exported{% else %} · no worked-hours timesheet required{% endif %}.
     {% else %}
       Pending.
     {% endif %}
@@ -63,7 +67,7 @@
   {% if payroll_error %}
     <div class="error">{{ payroll_error }}</div>
   {% endif %}
-  <p class="muted">Annual Leave is sent separately to Xero Holiday leave. Standard Public Holidays are left to Xero's Holiday Group.</p>
+  <p class="muted">Annual Leave is sent separately to Xero Holiday leave. Standard Public Holidays are left to Xero's Holiday Group.{% if payroll_basis == "salaried" %} No worked-hour Payroll timesheet is created for salaried staff.{% endif %}</p>
   {% if xero_configured and not payroll_exported %}
   <form method="post" action="/timesheet/{{ts.id}}/export-xero-payroll">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

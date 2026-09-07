@@ -9,10 +9,12 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from datetime import datetime, date, timedelta
+from calendar import monthrange
 from functools import wraps
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import or_
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -61,6 +63,7 @@ class User(db.Model):
     xero_payroll_id = db.Column(db.String(120), nullable=True, index=True)
     xero_payroll_employee_id = db.Column(db.String(120), nullable=True, index=True)
     xero_payroll_employee_name = db.Column(db.String(200), nullable=True)
+    payroll_basis = db.Column(db.String(20), nullable=False, default="hourly")
     is_primary_admin = db.Column(db.Boolean, nullable=False, default=False)
     can_timesheet = db.Column(db.Boolean, nullable=False, default=True)
 
@@ -132,6 +135,7 @@ def init_db():
     db.create_all()
 
     # Add standard paid day hours to existing databases.
+    payroll_basis_added = False
     try:
         inspector = db.inspect(db.engine)
         user_columns = {c["name"] for c in inspector.get_columns("users")}
@@ -175,6 +179,12 @@ def init_db():
                 conn.exec_driver_sql(
                     "ALTER TABLE users ADD COLUMN xero_payroll_employee_name VARCHAR(200)"
                 )
+        if "payroll_basis" not in user_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN payroll_basis VARCHAR(20) NOT NULL DEFAULT 'hourly'"
+                )
+            payroll_basis_added = True
         if "is_primary_admin" not in user_columns:
             with db.engine.begin() as conn:
                 conn.exec_driver_sql(
@@ -263,7 +273,7 @@ def init_db():
             username=admin_username,
             password_hash=generate_password_hash(admin_password),
             role="manager", normal_hours=40, ot1_start=40, ot2_start=50,
-            is_primary_admin=True
+            payroll_basis="salaried", is_primary_admin=True
         ))
 
         if not is_live:
@@ -306,11 +316,15 @@ def init_db():
         User.query.filter(
             User.role == "manager",
             User.is_primary_admin.is_(False),
-        ).update({"can_timesheet": False}, synchronize_session=False)
+        ).update({"can_timesheet": False, "payroll_basis": "none"}, synchronize_session=False)
 
-        # Keep the original Primary Admin unchanged.
+        # The Primary Admin can keep a personal timesheet/project trail while
+        # remaining salaried for Payroll. Existing employee users remain hourly
+        # unless explicitly changed on the Employees page.
         if primary:
             primary.can_timesheet = True
+            if payroll_basis_added or (primary.payroll_basis or "").strip().casefold() not in ("hourly", "salaried"):
+                primary.payroll_basis = "salaried"
     except Exception:
         db.session.rollback()
         raise
@@ -1038,6 +1052,81 @@ def xero_validate_weekly_calendar(calendar):
     return calendar
 
 
+def payroll_basis_for(employee):
+    basis = (getattr(employee, "payroll_basis", None) or "hourly").strip().casefold()
+    return basis if basis in ("hourly", "salaried", "none") else "hourly"
+
+
+def _shift_calendar_months(value, months):
+    total = value.year * 12 + (value.month - 1) + months
+    year, month_index = divmod(total, 12)
+    month = month_index + 1
+    source_last_day = monthrange(value.year, value.month)[1]
+    target_last_day = monthrange(year, month)[1]
+    day = target_last_day if value.day == source_last_day else min(value.day, target_last_day)
+    return date(year, month, day)
+
+
+def xero_calendar_period_for_date(calendar, target_date):
+    """Return the Xero pay-period bounds that contain target_date.
+
+    Xero requires explicit PeriodStartDate/PeriodEndDate when JWS supplies
+    partial-day leave hours. The calendar endpoint gives an anchor pay period;
+    this rolls that anchor backwards/forwards for weekly and monthly-style
+    calendars without assuming every employee is paid weekly.
+    """
+    if isinstance(target_date, str):
+        target_date = date.fromisoformat(_xero_date_only(target_date))
+
+    start_text = _xero_date_only(calendar.get("periodStartDate"))
+    end_text = _xero_date_only(calendar.get("periodEndDate"))
+    try:
+        anchor_start = date.fromisoformat(start_text)
+        anchor_end = date.fromisoformat(end_text)
+    except ValueError as exc:
+        raise RuntimeError("Xero did not return valid payroll calendar dates for leave.") from exc
+    if anchor_end < anchor_start:
+        raise RuntimeError("Xero returned an invalid payroll calendar period.")
+
+    kind = (calendar.get("calendarType") or "").strip().casefold()
+    fixed_days = {"weekly": 7, "fortnightly": 14, "fourweekly": 28}
+    if kind in fixed_days:
+        step = fixed_days[kind]
+        periods = (target_date - anchor_start).days // step
+        start = anchor_start + timedelta(days=periods * step)
+        end = anchor_end + timedelta(days=periods * step)
+        if target_date < start:
+            start -= timedelta(days=step)
+            end -= timedelta(days=step)
+        elif target_date > end:
+            start += timedelta(days=step)
+            end += timedelta(days=step)
+        return start.isoformat(), end.isoformat()
+
+    month_steps = {"monthly": 1, "quarterly": 3, "annual": 12}
+    if kind in month_steps:
+        step = month_steps[kind]
+        raw_months = (target_date.year - anchor_start.year) * 12 + target_date.month - anchor_start.month
+        periods = raw_months // step
+        start = _shift_calendar_months(anchor_start, periods * step)
+        end = _shift_calendar_months(anchor_end, periods * step)
+        for _ in range(3):
+            if target_date < start:
+                periods -= 1
+            elif target_date > end:
+                periods += 1
+            else:
+                return start.isoformat(), end.isoformat()
+            start = _shift_calendar_months(anchor_start, periods * step)
+            end = _shift_calendar_months(anchor_end, periods * step)
+        if start <= target_date <= end:
+            return start.isoformat(), end.isoformat()
+
+    raise RuntimeError(
+        f"Unsupported Xero payroll calendar type '{calendar.get('calendarType') or 'Unknown'}' for leave export."
+    )
+
+
 def xero_get_employee_pay_template(employee_id, token=None):
     token = token or xero_access_token()
     payload = xero_payroll_request("GET", f"/Employees/{employee_id}/PayTemplates", token=token) or {}
@@ -1227,7 +1316,7 @@ def xero_resolve_holiday_leave_type(employee_id, token=None):
     return matches[0]
 
 
-def xero_payroll_preflight(employee, token=None, require_ot2=False, as_of_date=None):
+def xero_payroll_base_preflight(employee, token=None):
     token = token or xero_access_token()
     detail = xero_resolve_payroll_employee(employee, token=token)
     employee_id = (detail.get("employeeID") or "").strip()
@@ -1236,7 +1325,25 @@ def xero_payroll_preflight(employee, token=None, require_ot2=False, as_of_date=N
         raise RuntimeError("Xero Payroll employee or payroll calendar ID is missing.")
 
     calendar = xero_get_payroll_calendar(calendar_id, token=token)
-    xero_validate_weekly_calendar(calendar)
+    holiday = xero_resolve_holiday_leave_type(employee_id, token=token)
+    return {
+        "employee": detail,
+        "employee_id": employee_id,
+        "employee_name": employee.xero_payroll_employee_name or employee.name,
+        "calendar": calendar,
+        "calendar_id": calendar_id,
+        "holiday": holiday,
+    }
+
+
+def xero_payroll_preflight(employee, token=None, require_ot2=False, as_of_date=None):
+    if payroll_basis_for(employee) != "hourly":
+        raise RuntimeError("Worked-hours Payroll timesheets are only used for hourly employees.")
+
+    token = token or xero_access_token()
+    profile = xero_payroll_base_preflight(employee, token=token)
+    xero_validate_weekly_calendar(profile["calendar"])
+    employee_id = profile["employee_id"]
     earnings = xero_get_employee_pay_template(employee_id, token=token)
     normal_item = xero_resolve_normal_earnings(
         employee_id, float(employee.basic_rate or 0), token=token, as_of_date=as_of_date
@@ -1247,18 +1354,12 @@ def xero_payroll_preflight(employee, token=None, require_ot2=False, as_of_date=N
         if not employee.ot2_start or not employee.ot2_rate:
             raise RuntimeError("This timesheet contains OT2 hours but OT2 is not configured for the employee.")
         ot2_item = xero_resolve_earning_template(earnings, "ot2", float(employee.ot2_rate or 0))
-    holiday = xero_resolve_holiday_leave_type(employee_id, token=token)
-    return {
-        "employee": detail,
-        "employee_id": employee_id,
-        "employee_name": employee.xero_payroll_employee_name or employee.name,
-        "calendar": calendar,
-        "calendar_id": calendar_id,
+    profile.update({
         "normal_item": normal_item,
         "ot1_item": ot1_item,
         "ot2_item": ot2_item,
-        "holiday": holiday,
-    }
+    })
+    return profile
 
 
 def payroll_daily_worked_hours(tsid):
@@ -1354,8 +1455,6 @@ def xero_export_annual_leave(ts, profile, token=None):
     token = token or xero_access_token()
     employee_id = profile["employee_id"]
     leave_type_id = profile["holiday"].get("leaveTypeID")
-    week_start = date.fromisoformat(ts.week_start)
-    week_end = (week_start + timedelta(days=6)).isoformat()
     existing = xero_get_employee_leaves(employee_id, token=token)
     sent = 0
 
@@ -1387,14 +1486,15 @@ def xero_export_annual_leave(ts, profile, token=None):
             if not leave_id:
                 raise RuntimeError(f"{row.work_date}: existing Xero leave has no Leave ID.")
         else:
+            period_start, period_end = xero_calendar_period_for_date(profile["calendar"], row.work_date)
             body = {
                 "leaveTypeID": leave_type_id,
                 "description": "JWS Timesheet annual leave",
                 "startDate": row.work_date,
                 "endDate": row.work_date,
                 "periods": [{
-                    "periodStartDate": ts.week_start,
-                    "periodEndDate": week_end,
+                    "periodStartDate": period_start,
+                    "periodEndDate": period_end,
                     "numberOfUnits": round(hours, 4),
                 }],
             }
@@ -1465,46 +1565,80 @@ def xero_find_matching_payroll_timesheet(employee_id, start_date, end_date, expe
 
 
 def export_timesheet_to_xero_payroll(ts):
-    """
-    Send JWS paid-work data to Xero UK Payroll.
+    """Send approved JWS payroll data to Xero UK Payroll.
 
-    - Worked time is net of the day's break.
-    - Overtime is based on worked hours only.
-    - Annual leave is created as Xero Holiday leave with explicit hours.
-    - Public holidays are not sent as timesheet/leave lines; Xero Holiday Groups handle them.
-    - The Xero Payroll timesheet is automatically approved after creation.
-    - JWS never creates, approves or posts a Xero pay run.
+    Hourly employees:
+      - net worked time (after breaks) is split into Normal / OT1 / OT2,
+      - a weekly Xero Payroll timesheet is created and approved.
+
+    Salaried employees:
+      - worked hours are accountability/project data only and never alter salary,
+      - no Xero Payroll timesheet is created.
+
+    Both payroll bases:
+      - Annual Leave is created against the employee's assigned Holiday leave
+        type with the correct Xero pay-period bounds, including partial hours.
+      - Standard Public Holidays are left to the employee's Xero Holiday Group.
+      - JWS never creates, approves or posts a Xero pay run.
     """
     if ts.status != "approved":
         raise RuntimeError("Only approved JWS timesheets can be sent to Xero Payroll.")
     if not xero_is_configured():
         raise RuntimeError("Xero is not configured in Railway.")
 
+    employee = ts.user
+    basis = payroll_basis_for(employee)
+    if basis == "none":
+        raise RuntimeError(f"{employee.name} is not configured as an hourly or salaried payroll employee.")
+
     token = xero_access_token()
     daily_hours = payroll_daily_worked_hours(ts.id)
     total_worked = round(sum(daily_hours.values()), 4)
-    _, _, ot2_total = worked_band_totals(ts.user, total_worked)
-    profile = xero_payroll_preflight(
-        ts.user, token=token, require_ot2=ot2_total > 0.0001, as_of_date=ts.week_start
-    )
 
-    # Public holidays are intentionally left to Xero's Holiday Group. If the
-    # employee actually worked on a public holiday, stop rather than guessing
-    # an enhanced-pay rule that has not been configured in JWS.
+    if basis == "hourly":
+        _, _, ot2_total = worked_band_totals(employee, total_worked)
+        profile = xero_payroll_preflight(
+            employee, token=token, require_ot2=ot2_total > 0.0001, as_of_date=ts.week_start
+        )
+    else:
+        profile = xero_payroll_base_preflight(employee, token=token)
+
     paid_rows = DayPaidHours.query.filter_by(timesheet_id=ts.id).all()
     public_holiday_dates = {
         r.work_date for r in paid_rows if float(r.public_holiday_hours or 0) > 0
     }
-    worked_public_holidays = [d for d in sorted(public_holiday_dates) if daily_hours.get(d, 0) > 0]
-    if worked_public_holidays:
-        raise RuntimeError(
-            "Worked hours were recorded on a Public Holiday (" + ", ".join(worked_public_holidays) + "). "
-            "A public-holiday working pay rule has not been configured, so Payroll export was stopped."
-        )
+
+    # For hourly staff, working on a Public Holiday needs an explicit enhanced
+    # pay rule before JWS can safely create Payroll earnings. Salaried staff do
+    # not have worked hours exported, so no payroll adjustment is made here.
+    if basis == "hourly":
+        worked_public_holidays = [d for d in sorted(public_holiday_dates) if daily_hours.get(d, 0) > 0]
+        if worked_public_holidays:
+            raise RuntimeError(
+                "Worked hours were recorded on a Public Holiday (" + ", ".join(worked_public_holidays) + "). "
+                "A public-holiday working pay rule has not been configured, so Payroll export was stopped."
+            )
 
     try:
+        # Annual leave applies to hourly and salaried staff. The leave period is
+        # taken from each employee's own Xero payroll calendar, so weekly and
+        # monthly/EOM employees can coexist safely.
+        xero_export_annual_leave(ts, profile, token=token)
+
+        if basis == "salaried":
+            ts.xero_payroll_exported_at = datetime.utcnow()
+            ts.xero_payroll_approved_at = None
+            ts.xero_payroll_export_error = None
+            db.session.commit()
+            return {
+                "timesheet_created": False,
+                "status": "Salaried - worked hours not exported",
+                "line_count": 0,
+                "payroll_basis": "salaried",
+            }
+
         lines = allocate_payroll_lines(
-            ts.user,
+            employee,
             daily_hours,
             profile["normal_item"],
             profile["ot1_item"],
@@ -1513,9 +1647,8 @@ def export_timesheet_to_xero_payroll(ts):
         start_date = ts.week_start
         end_date = (date.fromisoformat(ts.week_start) + timedelta(days=6)).isoformat()
 
-        # Before creating any leave, check for an existing timesheet for this
-        # employee/week. This avoids changing historical payroll if the week
-        # has already been completed in Xero.
+        # Before creating anything, check for an existing timesheet for this
+        # employee/week. JWS never overwrites historical Payroll.
         xero_ts = None
         if lines:
             if ts.xero_payroll_timesheet_id:
@@ -1543,18 +1676,12 @@ def export_timesheet_to_xero_payroll(ts):
                     "JWS will not change historical payroll."
                 )
 
-        # Annual leave is a separate Xero leave record. A normal public holiday
-        # is deliberately not sent here because Xero's assigned Holiday Group
-        # handles it when the bookkeeper prepares the pay run.
-        xero_export_annual_leave(ts, profile, token=token)
-
-        # If there is no worked time, annual leave/public holiday handling is
-        # sufficient and no empty Xero timesheet needs to be created.
+        # Leave-only/public-holiday-only weeks do not need an empty Payroll timesheet.
         if not lines:
             ts.xero_payroll_exported_at = datetime.utcnow()
             ts.xero_payroll_export_error = None
             db.session.commit()
-            return {"timesheet_created": False, "status": "No worked hours", "line_count": 0}
+            return {"timesheet_created": False, "status": "No worked hours", "line_count": 0, "payroll_basis": "hourly"}
 
         if not xero_ts:
             body = {
@@ -1601,6 +1728,7 @@ def export_timesheet_to_xero_payroll(ts):
             "status": status,
             "line_count": len(lines),
             "xero_timesheet_id": ts.xero_payroll_timesheet_id,
+            "payroll_basis": "hourly",
         }
     except Exception as exc:
         db.session.rollback()
@@ -1608,6 +1736,7 @@ def export_timesheet_to_xero_payroll(ts):
         ts.xero_payroll_export_error = str(exc)[:1200]
         db.session.commit()
         raise
+
 
 def xero_api_request(method, path, token=None, body=None, query=None, idempotency_key=None):
     """Call the Xero Projects API for this Custom Connection."""
@@ -2286,6 +2415,7 @@ def timesheet_summary(tsid):
         payroll_error=ts.xero_payroll_export_error,
         payroll_timesheet_id=ts.xero_payroll_timesheet_id,
         payroll_approved=bool(ts.xero_payroll_approved_at),
+        payroll_basis=payroll_basis_for(employee),
     )
 
 @app.post("/timesheet/<int:tsid>/<action>")
@@ -2314,7 +2444,7 @@ def timesheet_action(tsid, action):
                 if payroll.get("timesheet_created"):
                     payroll_result = f"Payroll: timesheet approved ({payroll.get('line_count', 0)} line(s))"
                 else:
-                    payroll_result = "Payroll: no worked-hours timesheet required"
+                    payroll_result = f"Payroll: {payroll.get('status') or 'no worked-hours timesheet required'}"
             except Exception as exc:
                 errors.append(f"Xero Payroll: {exc}")
 
@@ -2379,7 +2509,7 @@ def timesheet_export_xero_payroll(tsid):
                 "success",
             )
         else:
-            flash("Xero Payroll export complete. No worked-hours timesheet was required.", "success")
+            flash(f"Xero Payroll export complete. {result.get('status') or 'No worked-hours timesheet was required.'}", "success")
     except Exception as exc:
         flash(f"Xero Payroll export failed: {exc}", "error")
     return redirect(url_for("timesheet_summary", tsid=tsid))
@@ -2392,18 +2522,24 @@ def employees():
     if request.method == "POST":
         f = request.form
         username = f["username"].strip()
+        basis = (f.get("payroll_basis") or "hourly").strip().casefold()
+        if basis not in ("hourly", "salaried"):
+            basis = "hourly"
         if User.query.filter(db.func.lower(User.username) == username.lower()).first():
             flash("That username already exists.", "error")
         else:
+            normal_hours = float(f.get("normal_hours") or 40)
+            hourly = basis == "hourly"
             db.session.add(User(
                 name=f["name"].strip(), username=username,
                 password_hash=generate_password_hash(f["password"]), role="employee",
-                normal_hours=float(f.get("normal_hours") or 40),
-                basic_rate=float(f.get("basic_rate") or 0),
-                ot1_start=float(f.get("ot1_start") or 40),
-                ot1_rate=float(f.get("ot1_rate") or 0),
-                ot2_start=float(f["ot2_start"]) if f.get("ot2_start") else None,
-                ot2_rate=float(f.get("ot2_rate") or 0),
+                payroll_basis=basis,
+                normal_hours=normal_hours,
+                basic_rate=float(f.get("basic_rate") or 0) if hourly else 0,
+                ot1_start=float(f.get("ot1_start") or normal_hours) if hourly else normal_hours,
+                ot1_rate=float(f.get("ot1_rate") or 0) if hourly else 0,
+                ot2_start=(float(f["ot2_start"]) if f.get("ot2_start") else None) if hourly else None,
+                ot2_rate=float(f.get("ot2_rate") or 0) if hourly else 0,
                 standard_day_hours=8,
                 mon_thu_hours=float(f.get("mon_thu_hours") or 8.5),
                 friday_hours=float(f.get("friday_hours") or 6),
@@ -2411,7 +2547,11 @@ def employees():
             ))
             db.session.commit()
             return redirect(url_for("employees"))
-    rows = User.query.filter_by(role="employee").order_by(User.name).all()
+
+    rows = User.query.filter(
+        or_(User.role == "employee", User.is_primary_admin.is_(True))
+    ).order_by(User.is_primary_admin.desc(), User.name).all()
+
     xero_staff_members = []
     xero_staff_error = None
     if xero_is_configured():
@@ -2435,12 +2575,22 @@ def employees():
         xero_staff_error=xero_staff_error,
     )
 
+
+def _timesheet_payroll_user(uid):
+    employee = db.session.get(User, uid)
+    if not employee:
+        return None
+    if employee.role == "employee" or employee.is_primary_admin:
+        return employee
+    return None
+
+
 @app.post("/employees/<int:uid>/xero-user")
 @app.post("/employees/<int:uid>/xero-staff-member")
 @manager_required
 def employee_xero_user(uid):
-    employee = db.session.get(User, uid)
-    if not employee or employee.role != "employee":
+    employee = _timesheet_payroll_user(uid)
+    if not employee:
         return "Not found", 404
 
     selected_id = (request.form.get("xero_project_user_id") or "").strip()
@@ -2468,13 +2618,19 @@ def employee_xero_user(uid):
 
 
 @app.post("/employees/<int:uid>/payroll-id")
+@app.post("/employees/<int:uid>/payroll-profile")
 @manager_required
 def employee_payroll_id(uid):
-    employee = db.session.get(User, uid)
-    if not employee or employee.role != "employee":
+    employee = _timesheet_payroll_user(uid)
+    if not employee:
         return "Not found", 404
 
     payroll_id = (request.form.get("xero_payroll_id") or "").strip()
+    basis = (request.form.get("payroll_basis") or employee.payroll_basis or "hourly").strip().casefold()
+    if basis not in ("hourly", "salaried"):
+        flash("Payroll basis must be Hourly or Salaried.", "error")
+        return redirect(url_for("employees"))
+
     if payroll_id:
         duplicate = User.query.filter(
             User.id != employee.id,
@@ -2488,8 +2644,13 @@ def employee_payroll_id(uid):
             return redirect(url_for("employees"))
 
     employee.xero_payroll_id = payroll_id or None
+    employee.payroll_basis = basis
+    # Cached Xero employee details are safe to clear when the mapping changes.
+    if not payroll_id:
+        employee.xero_payroll_employee_id = None
+        employee.xero_payroll_employee_name = None
     db.session.commit()
-    flash(f"Xero Payroll ID saved for {employee.name}.", "success")
+    flash(f"Payroll profile saved for {employee.name}: {basis.title()}.", "success")
     return redirect(url_for("employees"))
 
 
@@ -2498,9 +2659,13 @@ def employee_payroll_id(uid):
 def employee_toggle(uid):
     employee = db.session.get(User, uid)
     if employee:
+        if employee.is_primary_admin:
+            flash("The Primary Admin account is protected and cannot be disabled.", "error")
+            return redirect(url_for("employees"))
         employee.active = not employee.active
         db.session.commit()
     return redirect(url_for("employees"))
+
 
 @app.get("/projects")
 @manager_required
@@ -2660,22 +2825,37 @@ def settings_notification_email_test():
 @app.post("/settings/xero-payroll/check")
 @manager_required
 def settings_xero_payroll_check():
-    employees = User.query.filter_by(role="employee", active=True).order_by(User.name).all()
-    employees = [e for e in employees if (e.xero_payroll_id or "").strip()]
+    employees = User.query.filter(
+        User.active.is_(True),
+        or_(User.role == "employee", User.is_primary_admin.is_(True)),
+    ).order_by(User.is_primary_admin.desc(), User.name).all()
+    employees = [
+        e for e in employees
+        if payroll_basis_for(e) in ("hourly", "salaried") and (e.xero_payroll_id or "").strip()
+    ]
     if not employees:
-        flash("No active employee has a Xero Payroll ID / employee number yet.", "error")
+        flash("No active timesheet user has a Xero Payroll ID / employee number yet.", "error")
         return redirect(url_for("settings"))
 
     try:
         token = xero_access_token()
         summaries = []
         for employee in employees:
-            profile = xero_payroll_preflight(employee, token=token, require_ot2=False)
-            summaries.append(
-                f"{employee.name} → {profile['employee_name']} (Payroll ID {employee.xero_payroll_id}); "
-                f"{profile['normal_item'].get('name')}; {profile['ot1_item'].get('name')}; "
-                f"Leave: {profile['holiday'].get('name')}"
-            )
+            basis = payroll_basis_for(employee)
+            if basis == "hourly":
+                profile = xero_payroll_preflight(employee, token=token, require_ot2=False)
+                summaries.append(
+                    f"{employee.name} → {profile['employee_name']} (Payroll ID {employee.xero_payroll_id}); "
+                    f"Hourly; {profile['normal_item'].get('name')}; {profile['ot1_item'].get('name')}; "
+                    f"Leave: {profile['holiday'].get('name')}"
+                )
+            else:
+                profile = xero_payroll_base_preflight(employee, token=token)
+                calendar_type = profile["calendar"].get("calendarType") or "Payroll calendar"
+                summaries.append(
+                    f"{employee.name} → {profile['employee_name']} (Payroll ID {employee.xero_payroll_id}); "
+                    f"Salaried ({calendar_type}); worked hours not exported; Leave: {profile['holiday'].get('name')}"
+                )
         flash("Xero Payroll check passed. " + " | ".join(summaries), "success")
     except Exception as exc:
         db.session.rollback()
@@ -2715,6 +2895,7 @@ def settings_admin_add():
         standard_day_hours=0,
         mon_thu_hours=0,
         friday_hours=0,
+        payroll_basis="none",
         is_primary_admin=False,
         can_timesheet=False,
     )
