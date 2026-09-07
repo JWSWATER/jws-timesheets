@@ -89,6 +89,8 @@ class Timesheet(db.Model):
     submitted_at = db.Column(db.DateTime, nullable=True)
     approved_at = db.Column(db.DateTime, nullable=True)
     rejected_at = db.Column(db.DateTime, nullable=True)
+    amended_at = db.Column(db.DateTime, nullable=True)
+    amended_by_user_id = db.Column(db.Integer, nullable=True)
     xero_projects_exported_at = db.Column(db.DateTime, nullable=True)
     xero_projects_export_error = db.Column(db.String(1200), nullable=True)
     xero_payroll_timesheet_id = db.Column(db.String(120), nullable=True, index=True)
@@ -214,6 +216,16 @@ def init_db():
                 )
 
         timesheet_columns = {c["name"] for c in inspector.get_columns("timesheets")}
+        if "amended_at" not in timesheet_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE timesheets ADD COLUMN amended_at TIMESTAMP"
+                )
+        if "amended_by_user_id" not in timesheet_columns:
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE timesheets ADD COLUMN amended_by_user_id INTEGER"
+                )
         if "xero_projects_exported_at" not in timesheet_columns:
             with db.engine.begin() as conn:
                 conn.exec_driver_sql(
@@ -490,22 +502,50 @@ def dashboard():
 @login_required
 def save_timesheet():
     data = request.get_json(force=True)
-    u = current_user()
-    if not u.can_timesheet:
-        return jsonify({"ok": False, "error": "This administrator account does not have a timesheet."}), 403
-    week = data["week"]
-    ts = Timesheet.query.filter_by(user_id=u.id, week_start=week).first()
-    if not ts:
-        ts = Timesheet(user_id=u.id, week_start=week, status="draft")
-        db.session.add(ts)
-        db.session.flush()
+    actor = current_user()
+    admin_amend = bool(data.get("adminAmend"))
 
-    if ts.status in ("submitted", "approved"):
-        return jsonify({"ok": False, "error": "Timesheet is locked"}), 400
+    if admin_amend:
+        # Only the protected Primary Admin may directly amend another person's
+        # submitted timesheet. Approved/exported timesheets remain immutable.
+        if not actor or actor.role != "manager" or not actor.is_primary_admin:
+            return jsonify({"ok": False, "error": "Only the Primary Admin can amend submitted timesheets."}), 403
+        try:
+            tsid = int(data.get("timesheetId"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Invalid timesheet."}), 400
+        ts = db.session.get(Timesheet, tsid)
+        if not ts:
+            return jsonify({"ok": False, "error": "Timesheet not found."}), 404
+        if ts.week_start != data.get("week"):
+            return jsonify({"ok": False, "error": "Timesheet week does not match."}), 400
+        if ts.status != "submitted":
+            return jsonify({
+                "ok": False,
+                "error": "Only submitted timesheets awaiting approval can be amended. Approved timesheets are locked."
+            }), 400
+        u = ts.user
+        if not u or not u.can_timesheet:
+            return jsonify({"ok": False, "error": "This user does not have a timesheet."}), 400
+    else:
+        u = actor
+        if not u.can_timesheet:
+            return jsonify({"ok": False, "error": "This administrator account does not have a timesheet."}), 403
+        week = data["week"]
+        ts = Timesheet.query.filter_by(user_id=u.id, week_start=week).first()
+        if not ts:
+            ts = Timesheet(user_id=u.id, week_start=week, status="draft")
+            db.session.add(ts)
+            db.session.flush()
 
-    # On final submission, every worked row must be complete. The description
-    # becomes the Xero Project task name after manager approval.
-    if data.get("submit"):
+        if ts.status in ("submitted", "approved"):
+            return jsonify({"ok": False, "error": "Timesheet is locked"}), 400
+
+    finalised_data = bool(data.get("submit")) or admin_amend
+
+    # On final submission or an admin amendment, every worked row must be
+    # complete. The description becomes the Xero Project task name after approval.
+    if finalised_data:
         for day in data.get("days", []):
             for row in day.get("entries", []):
                 has_any = any([
@@ -548,12 +588,12 @@ def save_timesheet():
             if is_working_weekday else 0.0
         )
         is_public_holiday = bool(day.get("publicHoliday")) if is_working_weekday else False
-        if data.get("submit") and is_public_holiday and annual_leave_hours > 0:
+        if finalised_data and is_public_holiday and annual_leave_hours > 0:
             return jsonify({
                 "ok": False,
                 "error": f"{day.get('date')}: Annual Leave and Public Holiday cannot both be selected."
             }), 400
-        if data.get("submit") and annual_leave_hours > scheduled_hours + 0.001:
+        if finalised_data and annual_leave_hours > scheduled_hours + 0.001:
             return jsonify({
                 "ok": False,
                 "error": f"{day.get('date')}: Annual Leave cannot exceed {scheduled_hours:g} hours for this day."
@@ -574,14 +614,20 @@ def save_timesheet():
                     description=e.get("description", "")
                 ))
 
-    if data.get("submit"):
+    if admin_amend:
+        # Keep the timesheet in Submitted status so it remains in the manager
+        # approval queue, while retaining an audit stamp of the amendment.
+        ts.status = "submitted"
+        ts.amended_at = datetime.utcnow()
+        ts.amended_by_user_id = actor.id
+    elif data.get("submit"):
         ts.status = "submitted"
         ts.submitted_at = datetime.utcnow()
 
     db.session.commit()
 
     notification_warning = None
-    if data.get("submit"):
+    if data.get("submit") and not admin_amend:
         try:
             sent_count = notify_timesheet_submitted(ts)
             app_setting_set("submission_email_last_error", "")
@@ -598,7 +644,12 @@ def save_timesheet():
                 db.session.rollback()
             notification_warning = str(exc)
 
-    return jsonify({"ok": True, "notification_warning": notification_warning})
+    return jsonify({
+        "ok": True,
+        "notification_warning": notification_warning,
+        "admin_amend": admin_amend,
+        "redirect_url": url_for("timesheet_summary", tsid=ts.id) if admin_amend else None,
+    })
 
 
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
@@ -2379,6 +2430,62 @@ def management():
         })
     return render_template("management.html", user=u, rows=rows)
 
+@app.get("/timesheet/<int:tsid>/amend")
+@primary_admin_required
+def amend_submitted_timesheet(tsid):
+    actor = current_user()
+    ts = db.session.get(Timesheet, tsid)
+    if not ts:
+        return "Not found", 404
+    if ts.status != "submitted":
+        flash("Only submitted timesheets awaiting approval can be amended. Approved timesheets are locked.", "error")
+        return redirect(url_for("timesheet_summary", tsid=tsid))
+
+    employee = ts.user
+    if not employee or not employee.can_timesheet:
+        flash("This user does not have a timesheet.", "error")
+        return redirect(url_for("timesheet_summary", tsid=tsid))
+
+    # Keep the project selector fresh, but fall back to the cached project list
+    # if Xero is temporarily unavailable.
+    maybe_sync_xero_projects()
+
+    entries = Entry.query.filter_by(timesheet_id=ts.id).order_by(Entry.work_date, Entry.id).all()
+    break_rows = Break.query.filter_by(timesheet_id=ts.id).all()
+    break_map = {r.work_date: r.minutes for r in break_rows}
+    paid_rows = DayPaidHours.query.filter_by(timesheet_id=ts.id).all()
+    paid_map = {r.work_date: r for r in paid_rows}
+
+    days = []
+    start_date = date.fromisoformat(ts.week_start)
+    for i in range(7):
+        work_date = (start_date + timedelta(days=i)).isoformat()
+        day_entries = [e for e in entries if e.work_date == work_date]
+        if not day_entries:
+            day_entries = [None]
+        paid = paid_map.get(work_date)
+        days.append({
+            "date": work_date,
+            "label": (start_date + timedelta(days=i)).strftime("%A %d %B %Y"),
+            "entries": day_entries,
+            "break": break_map.get(work_date, 0),
+            "annual_leave_hours": float(paid.annual_leave_hours or 0) if paid else 0,
+            "public_holiday": bool(paid and float(paid.public_holiday_hours or 0) > 0),
+            "public_holiday_hours": float(paid.public_holiday_hours or 0) if paid else 0,
+            "scheduled_hours": scheduled_hours_for_date(employee, work_date),
+        })
+
+    return render_template(
+        "dashboard.html",
+        user=actor,
+        timesheet=ts,
+        week=ts.week_start,
+        days=days,
+        admin_amend=True,
+        editing_employee=employee,
+    )
+
+
 @app.get("/timesheet/<int:tsid>")
 @manager_required
 def timesheet_summary(tsid):
@@ -2401,6 +2508,7 @@ def timesheet_summary(tsid):
     ot2 = max(0, worked_total - ot2_start) if ot2_start else 0
     project_entries = [e for e in entries if e.project and e.project.source == "xero"]
     xero_sent_count = sum(1 for e in project_entries if e.xero_time_entry_id)
+    amended_by = db.session.get(User, ts.amended_by_user_id) if ts.amended_by_user_id else None
     return render_template(
         "summary.html", user=u, ts=ts, employee=employee, entries=entries,
         breaks=break_map, paid_rows=paid_rows,
@@ -2416,6 +2524,7 @@ def timesheet_summary(tsid):
         payroll_timesheet_id=ts.xero_payroll_timesheet_id,
         payroll_approved=bool(ts.xero_payroll_approved_at),
         payroll_basis=payroll_basis_for(employee),
+        amended_by=amended_by,
     )
 
 @app.post("/timesheet/<int:tsid>/<action>")

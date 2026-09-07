@@ -22,9 +22,11 @@ function bindRow(r){r.querySelectorAll("input").forEach(i=>i.addEventListener("i
 p.addEventListener("input",async()=>{let q=encodeURIComponent(p.value);let data=await fetch("/api/projects?q="+q).then(x=>x.json());s.innerHTML=data.map(x=>`<button type="button" data-id="${x.id}">${x.name}</button>`).join("");s.classList.toggle("hidden",!data.length);s.querySelectorAll("button").forEach(b=>b.onclick=()=>{p.value=b.textContent;p.dataset.projectId=b.dataset.id;s.classList.add("hidden")})});
 p.addEventListener("focus",()=>p.dispatchEvent(new Event("input")));r.querySelector(".delete-row").onclick=()=>{let list=r.parentElement;if(list.children.length>1)r.remove();else r.querySelectorAll("input").forEach(x=>x.value="");recalc()}}
 document.querySelectorAll(".entry-row").forEach(bindRow);document.querySelectorAll(".break-input,.paid-hours-input").forEach(i=>i.addEventListener("input",recalc));document.querySelectorAll(".public-holiday-input").forEach(i=>i.addEventListener("change",recalc));document.querySelectorAll(".add-row").forEach(b=>b.onclick=()=>{let list=b.parentElement.querySelector(".entry-list"),r=list.children[0].cloneNode(true);r.querySelectorAll("input").forEach(x=>{x.value="";if(x.classList.contains("project-search"))x.dataset.projectId=""});list.appendChild(r);bindRow(r)});
-function payload(submit=false){return{
-  week:document.getElementById("timesheetForm").dataset.week,
+function payload(submit=false){const form=document.getElementById("timesheetForm");return{
+  week:form.dataset.week,
   submit,
+  adminAmend:form.dataset.adminAmend==="true",
+  timesheetId:form.dataset.timesheetId||null,
   days:[...document.querySelectorAll(".day-card")].map(d=>({
     date:d.dataset.date,
     breakMinutes:d.querySelector(".break-input").value,
@@ -38,8 +40,8 @@ function payload(submit=false){return{
     }))
   }))
 }}
-async function save(submit){let res=await fetch("/api/save-timesheet",{method:"POST",headers:{"Content-Type":"application/json","X-CSRFToken":document.querySelector('meta[name="csrf-token"]').content},body:JSON.stringify(payload(submit))});let j=await res.json();if(!j.ok)alert(j.error||"Could not save");else{alert(submit?"Timesheet submitted.":"Draft saved.");if(submit)location.reload()}}
-let s=document.getElementById("saveDraft"),t=document.getElementById("submitTimesheet");if(s)s.onclick=()=>save(false);if(t)t.onclick=()=>save(true);let wk=document.getElementById("weekStart");if(wk)wk.onchange=()=>location.href="/dashboard?week="+wk.value;
+async function save(submit){let res=await fetch("/api/save-timesheet",{method:"POST",headers:{"Content-Type":"application/json","X-CSRFToken":document.querySelector('meta[name="csrf-token"]').content},body:JSON.stringify(payload(submit))});let j=await res.json();if(!j.ok)alert(j.error||"Could not save");else{const form=document.getElementById("timesheetForm");if(form.dataset.adminAmend==="true"){alert("Timesheet amendment saved.");location.href=j.redirect_url||("/timesheet/"+form.dataset.timesheetId);return;}alert(submit?"Timesheet submitted.":"Draft saved.");if(submit)location.reload()}}
+let s=document.getElementById("saveDraft"),t=document.getElementById("submitTimesheet"),a=document.getElementById("saveAmendment");if(s)s.onclick=()=>save(false);if(t)t.onclick=()=>save(true);if(a)a.onclick=()=>save(false);let wk=document.getElementById("weekStart");if(wk)wk.onchange=()=>location.href="/dashboard?week="+wk.value;
 if(window.TIMESHEET_LOCKED){document.querySelectorAll("#timesheetForm input,#timesheetForm button").forEach(x=>x.disabled=true)}
 recalc();
 if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("/static/service-worker.js"));
