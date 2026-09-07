@@ -534,7 +534,7 @@ def save_timesheet():
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 XERO_PROJECTS_BASE_URL = "https://api.xero.com/projects.xro/2.0"
 XERO_ACCOUNTING_BASE_URL = "https://api.xero.com/api.xro/2.0"
-XERO_PROJECTS_URL = f"{XERO_PROJECTS_BASE_URL}/Projects"
+XERO_PROJECTS_URL = f"{XERO_PROJECTS_BASE_URL}/projects"
 
 def _valid_email(value):
     value = (value or "").strip()
@@ -815,7 +815,7 @@ def xero_get_project_users(token=None):
     while True:
         payload = xero_api_request(
             "GET",
-            "/ProjectsUsers",
+            "/projectsusers",
             token=token,
             query={"page": page, "pageSize": 500},
         ) or {}
@@ -883,7 +883,7 @@ def xero_get_project_tasks(project_id, token=None):
     while True:
         payload = xero_api_request(
             "GET",
-            f"/Projects/{project_id}/Tasks",
+            f"/projects/{project_id}/tasks",
             token=token,
             query={"page": page, "pageSize": 500},
         ) or {}
@@ -941,7 +941,7 @@ def xero_find_or_create_task(project_id, description, token=None):
     }
     return xero_api_request(
         "POST",
-        f"/Projects/{project_id}/Tasks",
+        f"/projects/{project_id}/tasks",
         token=token,
         body=body,
         idempotency_key=_xero_idempotency("task", f"{project_id}|{wanted}"),
@@ -975,8 +975,7 @@ def hhmm_minutes(start, finish):
 
 def allocate_day_break(entry_rows, break_minutes):
     """
-    Allocate the day's single break proportionally across worked rows.
-    This keeps Xero Project minutes equal to the approved JWS worked total.
+    Legacy helper retained for compatibility. Xero Project export no longer deducts breaks.
     """
     gross = [hhmm_minutes(e.start_time, e.finish_time) for e in entry_rows]
     if any(m <= 0 for m in gross):
@@ -1023,15 +1022,9 @@ def export_timesheet_to_xero_projects(ts):
         db.session.commit()
         return 0
 
-    breaks = {r.work_date: r.minutes for r in Break.query.filter_by(timesheet_id=ts.id).all()}
-    entries_by_day = {}
-    for entry in entries:
-        entries_by_day.setdefault(entry.work_date, []).append(entry)
-
-    net_minutes = {}
-    for work_date, rows in entries_by_day.items():
-        net_minutes.update(allocate_day_break(rows, breaks.get(work_date, 0)))
-
+    # Xero Projects receives the full Start-to-Finish duration for each
+    # project entry. Breaks remain relevant to JWS paid/payroll totals but are
+    # deliberately NOT deducted from project chargeable time.
     sent = 0
     try:
         for entry in entries:
@@ -1054,7 +1047,7 @@ def export_timesheet_to_xero_projects(ts):
             if not task_id:
                 raise RuntimeError(f"Xero did not return a Task ID for '{description[:100]}'.")
 
-            duration = int(net_minutes.get(entry.id) or 0)
+            duration = hhmm_minutes(entry.start_time, entry.finish_time)
             if duration < 1:
                 raise RuntimeError(f"{entry.work_date}: calculated Xero duration is less than one minute.")
 
@@ -1067,7 +1060,7 @@ def export_timesheet_to_xero_projects(ts):
             }
             created = xero_api_request(
                 "POST",
-                f"/Projects/{project_id}/Time",
+                f"/projects/{project_id}/time",
                 token=token,
                 body=payload,
                 idempotency_key=_xero_idempotency("time", f"entry-{entry.id}"),
