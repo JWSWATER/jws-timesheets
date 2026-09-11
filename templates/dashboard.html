@@ -18,25 +18,25 @@
 {% if d.scheduled_hours > 0 %}
 <label>Annual Leave (hrs)
   <input class="annual-leave-input paid-hours-input" type="number" min="0" step=".25" value="{{ d.annual_leave_hours }}">
-  <small>Normal day: {{ "%.2f"|format(d.scheduled_hours) }} hrs</small>
+  <small>Normal day: {{ d.scheduled_hours|hm }}</small>
 </label>
 <label class="public-holiday-wrap ph-control">
   <span>Public Holiday?</span>
   <input class="public-holiday-input" type="checkbox" {% if d.public_holiday %}checked{% endif %}>
 </label>
 {% endif %}
-<div class="day-total">0.00 hrs</div></div>
+<div class="day-total">0h 00m</div></div>
 <div class="entries"><div class="entry-head"><span>Start</span><span>Finish</span><span>Project</span><span>Description</span><span></span></div><div class="entry-list">
-{% for e in d.entries %}<div class="entry-row"><input type="time" class="start" value="{{ e.start_time if e else '' }}"><input type="time" class="finish" value="{{ e.finish_time if e else '' }}">
+{% for e in d.entries %}<div class="entry-row" data-work-date="{{ d.date }}"><input type="time" class="start" value="{{ e.start_time if e else '' }}"><input type="time" class="finish" value="{{ e.finish_time if e else '' }}">
 <div class="project-wrap"><input class="project-search" data-project-id="{{ e.project_id if e else '' }}" value="{{ e.project.name if e and e.project else '' }}" placeholder="Type project name or ref"><div class="project-suggestions hidden"></div></div>
 <input class="description" value="{{ e.description if e else '' }}" placeholder="Description"><button type="button" class="delete-row">🗑</button></div>{% endfor %}
 </div><button type="button" class="add-row">＋ Add another</button></div></div>{% endfor %}
 <div class="card week-summary">
 <div class="week-totals">
-  <div><span>Worked</span><strong id="workedTotal">0.00 hrs</strong></div>
-  <div><span>Annual Leave</span><strong id="annualLeaveTotal">0.00 hrs</strong></div>
-  <div><span>Public Holiday</span><strong id="publicHolidayTotal">0.00 hrs</strong></div>
-  <div><span>Paid Total</span><strong id="weekTotal">0.00 hrs</strong></div>
+  <div><span>Worked</span><strong id="workedTotal">0h 00m</strong></div>
+  <div><span>Annual Leave</span><strong id="annualLeaveTotal">0h 00m</strong></div>
+  <div><span>Public Holiday</span><strong id="publicHolidayTotal">0h 00m</strong></div>
+  <div><span>Paid Total</span><strong id="weekTotal">0h 00m</strong></div>
 </div><div class="actions">
 {% if admin_amend %}
 <a class="btn secondary" href="/timesheet/{{ timesheet.id }}">Cancel</a>

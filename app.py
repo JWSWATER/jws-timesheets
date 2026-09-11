@@ -43,6 +43,19 @@ app.config.update(
 db = SQLAlchemy(app)
 csrf = CSRFProtect(app)
 
+def format_hours_minutes(value):
+    """Render decimal hours as whole hours and minutes for the UI."""
+    try:
+        total_minutes = int(round(float(value or 0) * 60))
+    except (TypeError, ValueError):
+        total_minutes = 0
+    sign = "-" if total_minutes < 0 else ""
+    total_minutes = abs(total_minutes)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{sign}{hours}h {minutes:02d}m"
+
+app.jinja_env.filters["hm"] = format_hours_minutes
+
 class User(db.Model):
     __tablename__ = "users"
     id = db.Column(db.Integer, primary_key=True)
@@ -559,9 +572,18 @@ def save_timesheet():
 
     # On final submission or an admin amendment, every worked row must be
     # complete. The description becomes the Xero Project task name after approval.
+    week_start_date = date.fromisoformat(ts.week_start)
+    valid_work_dates = {
+        (week_start_date + timedelta(days=i)).isoformat()
+        for i in range(7)
+    }
+
     if finalised_data:
         for day in data.get("days", []):
             for row in day.get("entries", []):
+                row_date = row.get("workDate") or day.get("date")
+                if row_date not in valid_work_dates:
+                    return jsonify({"ok": False, "error": "An entry has an invalid work date."}), 400
                 has_any = any([
                     row.get("start"), row.get("finish"),
                     row.get("projectId"), row.get("description")
@@ -571,17 +593,17 @@ def save_timesheet():
                 if not row.get("start") or not row.get("finish"):
                     return jsonify({
                         "ok": False,
-                        "error": f"{day.get('date')}: enter both Start and Finish."
+                        "error": f"{row_date}: enter both Start and Finish."
                     }), 400
                 if not row.get("projectId"):
                     return jsonify({
                         "ok": False,
-                        "error": f"{day.get('date')}: select a Project."
+                        "error": f"{row_date}: select a Project."
                     }), 400
                 if not (row.get("description") or "").strip():
                     return jsonify({
                         "ok": False,
-                        "error": f"{day.get('date')}: enter a Description. This will become the Xero task name."
+                        "error": f"{row_date}: enter a Description. This will become the Xero task name."
                     }), 400
 
     Entry.query.filter_by(timesheet_id=ts.id).delete()
@@ -621,8 +643,14 @@ def save_timesheet():
         ))
         for e in day["entries"]:
             if any([e.get("start"), e.get("finish"), e.get("projectId"), e.get("description")]):
+                # Every row carries its own work date. This prevents a row from
+                # being re-associated with the following day when one day has
+                # several project rows and a draft is saved/reloaded.
+                entry_work_date = e.get("workDate") or day["date"]
+                if entry_work_date not in valid_work_dates:
+                    return jsonify({"ok": False, "error": "An entry has an invalid work date."}), 400
                 db.session.add(Entry(
-                    timesheet_id=ts.id, work_date=day["date"],
+                    timesheet_id=ts.id, work_date=entry_work_date,
                     start_time=e.get("start") or None, finish_time=e.get("finish") or None,
                     project_id=int(e["projectId"]) if e.get("projectId") else None,
                     description=e.get("description", "")

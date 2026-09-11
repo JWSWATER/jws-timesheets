@@ -48,24 +48,24 @@
   {% if r.annual_leave_hours or r.public_holiday_hours %}
   <tr>
     <td>{{ r.work_date }}</td>
-    <td>{{ "%.2f"|format(r.annual_leave_hours) }} hrs</td>
-    <td>{{ "%.2f"|format(r.public_holiday_hours) }} hrs</td>
+    <td>{{ r.annual_leave_hours|hm }}</td>
+    <td>{{ r.public_holiday_hours|hm }}</td>
   </tr>
   {% endif %}
 {% endfor %}
 </table>
 {% endif %}
 <p>
-<b>Worked:</b> {{"%.2f"|format(worked_total)}} hrs ·
-<b>Annual Leave:</b> {{"%.2f"|format(annual_leave_total)}} hrs ·
-<b>Public Holiday:</b> {{"%.2f"|format(public_holiday_total)}} hrs ·
-<b>Paid Total:</b> {{"%.2f"|format(total)}} hrs
+<b>Worked:</b> {{ worked_total|hm }} ·
+<b>Annual Leave:</b> {{ annual_leave_total|hm }} ·
+<b>Public Holiday:</b> {{ public_holiday_total|hm }} ·
+<b>Paid Total:</b> {{ total|hm }}
 </p>
 {% if payroll_basis == "hourly" %}
 <p>
-<b>Normal Worked:</b> {{"%.2f"|format(normal)}} hrs ·
-<b>OT1:</b> {{"%.2f"|format(ot1)}} hrs ·
-<b>OT2:</b> {{"%.2f"|format(ot2)}} hrs
+<b>Normal Worked:</b> {{ normal|hm }} ·
+<b>OT1:</b> {{ ot1|hm }} ·
+<b>OT2:</b> {{ ot2|hm }}
 </p>
 <p class="muted">Annual Leave and Public Holiday hours count towards the weekly overtime threshold; only actual worked hours are paid at overtime rates.</p>
 {% else %}
