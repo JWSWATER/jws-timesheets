@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import math
 import re
+import time
 from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -2362,34 +2363,15 @@ def export_timesheet_to_xero_projects(ts):
             if not task_id:
                 raise RuntimeError(f"Xero did not return a Task ID for '{description[:100]}'.")
 
-            # Verify the task really belongs to this exact project.
-            try:
-                live_task = xero_get_project_task(project_id, task_id, token=token) or {}
-            except Exception:
-                # One recovery attempt: re-read the project's active tasks and
-                # find the exact task name again.
-                wanted_task_name = description.strip()[:100].casefold()
-                live_matches = [
-                    t for t in xero_get_project_tasks(project_id, token=token)
-                    if (t.get("name") or "").strip().casefold() == wanted_task_name
-                    and (t.get("status") or "ACTIVE") == "ACTIVE"
-                ]
-                if len(live_matches) == 1:
-                    live_task = live_matches[0]
-                    task_id = live_task.get("taskId")
-                else:
-                    raise RuntimeError(
-                        f"{entry.work_date}: Xero task '{description[:100]}' could not be "
-                        "verified on the selected project."
-                    )
-
-            if (live_task.get("projectId") or "").strip() not in ("", project_id):
+            # A successful POST /Projects/{projectId}/Tasks returns the created
+            # task object, including taskId/projectId. Trust that response rather
+            # than immediately re-reading the task: Xero can briefly lag on a
+            # read directly after creation, which previously caused a false
+            # "could not be verified" failure even though the task was created.
+            returned_project_id = (task.get("projectId") or "").strip()
+            if returned_project_id and returned_project_id != project_id:
                 raise RuntimeError(
-                    f"{entry.work_date}: the Xero task belongs to a different project."
-                )
-            if (live_task.get("taskId") or "").strip() != task_id:
-                raise RuntimeError(
-                    f"{entry.work_date}: Xero returned a different Task ID than expected."
+                    f"{entry.work_date}: Xero returned a task for a different project."
                 )
 
             duration = hhmm_minutes(entry.start_time, entry.finish_time)
@@ -2403,28 +2385,45 @@ def export_timesheet_to_xero_projects(ts):
                 "duration": duration,
                 "description": description,
             }
-            try:
-                created = xero_api_request(
-                    "POST",
-                    f"/Projects/{project_id}/Time",
-                    token=token,
-                    body=payload,
-                    idempotency_key=_xero_idempotency(
-                        "time-v5-staff-fallback",
-                        f"entry-{entry.id}|{project_id}|"
-                        f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
-                    ),
-                ) or {}
-            except RuntimeError as exc:
-                if "(404)" in str(exc):
-                    raise RuntimeError(
-                        f"{entry.work_date}: Xero accepted the Project and Task, but rejected "
-                        f"the time entry for Staff Member '{ts.user.xero_project_user_name or ts.user.name}' "
-                        f"with 404. Project={project_id}, Task={task_id}, StaffID={xero_user_id}. "
-                        "The selected employee has been sent using the Xero UserID from the Staff/User list. "
-                        f"Original Xero response: {exc}"
-                    ) from exc
-                raise
+            created = None
+            last_exc = None
+            # Newly-created Xero tasks can take a moment before the Time endpoint
+            # accepts them. Retry the exact same idempotent request briefly on
+            # Xero 400/404 responses; the stable Idempotency-Key prevents
+            # duplicate time entries if Xero processed an earlier attempt.
+            for attempt, delay in enumerate((0, 1, 2), start=1):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    created = xero_api_request(
+                        "POST",
+                        f"/Projects/{project_id}/Time",
+                        token=token,
+                        body=payload,
+                        idempotency_key=_xero_idempotency(
+                            "time-v5-staff-fallback",
+                            f"entry-{entry.id}|{project_id}|"
+                            f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
+                        ),
+                    ) or {}
+                    last_exc = None
+                    break
+                except RuntimeError as exc:
+                    last_exc = exc
+                    text = str(exc)
+                    if attempt < 3 and ("(400)" in text or "(404)" in text):
+                        continue
+                    if "(404)" in text:
+                        raise RuntimeError(
+                            f"{entry.work_date}: Xero accepted the Project and Task, but rejected "
+                            f"the time entry for Staff Member '{ts.user.xero_project_user_name or ts.user.name}' "
+                            f"with 404. Project={project_id}, Task={task_id}, StaffID={xero_user_id}. "
+                            "The selected employee has been sent using the Xero UserID from the Staff/User list. "
+                            f"Original Xero response: {exc}"
+                        ) from exc
+                    raise
+            if last_exc is not None:
+                raise last_exc
 
             time_entry_id = created.get("timeEntryId")
             if not time_entry_id:
