@@ -2001,7 +2001,13 @@ def export_timesheet_to_xero_payroll(ts):
 
 
 def xero_api_request(method, path, token=None, body=None, query=None, idempotency_key=None):
-    """Call the Xero Projects API for this Custom Connection."""
+    """Call the Xero Projects API for this Custom Connection.
+
+    Xero enforces per-minute rate limits and returns HTTP 429 together with a
+    Retry-After header. Retry one rate-limited request when the requested wait
+    is short enough for the web request; otherwise return a clear message so
+    the user can retry without losing any already-exported rows.
+    """
     token = token or xero_access_token()
     url = f"{XERO_PROJECTS_BASE_URL}{path}"
     if query:
@@ -2018,20 +2024,40 @@ def xero_api_request(method, path, token=None, body=None, query=None, idempotenc
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key[:128]
 
-    req = Request(url, data=data, method=method.upper(), headers=headers)
-    try:
-        with urlopen(req, timeout=35) as response:
-            raw = response.read().decode("utf-8")
-            if not raw:
-                return None
-            return json.loads(raw)
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Xero Projects API failed ({exc.code}) on {method.upper()} {path}: {detail[:700]}"
-        ) from exc
-    except URLError as exc:
-        raise RuntimeError(f"Could not contact Xero Projects: {exc.reason}") from exc
+    for attempt in range(2):
+        req = Request(url, data=data, method=method.upper(), headers=headers)
+        try:
+            with urlopen(req, timeout=35) as response:
+                raw = response.read().decode("utf-8")
+                if not raw:
+                    return None
+                return json.loads(raw)
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 429:
+                try:
+                    retry_after = int(float((exc.headers or {}).get("Retry-After", "0") or 0))
+                except (TypeError, ValueError):
+                    retry_after = 0
+
+                # Keep the request safely within the current Gunicorn timeout.
+                # Most short minute-limit collisions clear quickly. Longer
+                # waits are surfaced to the user rather than tying up a worker.
+                if attempt == 0 and 0 < retry_after <= 20:
+                    time.sleep(retry_after)
+                    continue
+
+                wait_text = f" Retry after about {retry_after} seconds." if retry_after else " Retry shortly."
+                raise RuntimeError(
+                    "Xero Projects rate limit reached (429)." + wait_text +
+                    " Already-sent rows are preserved and will not be resent."
+                ) from exc
+
+            raise RuntimeError(
+                f"Xero Projects API failed ({exc.code}) on {method.upper()} {path}: {detail[:700]}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not contact Xero Projects: {exc.reason}") from exc
 
 
 def xero_get_project_users(token=None):
@@ -2341,24 +2367,21 @@ def export_timesheet_to_xero_projects(ts):
 
             project_id = entry.project.external_id
 
-            # Verify the local Xero Project mapping still points to a live
-            # Xero Project before creating/logging time.
+            # Do not make a separate GET /Projects/{id} call for every pending
+            # row. The subsequent Tasks endpoint already proves whether the
+            # linked project exists, and avoiding the redundant request greatly
+            # reduces Xero API usage/rate-limit pressure during batch exports.
             try:
-                live_project = xero_get_project(project_id, token=token) or {}
-            except Exception as exc:
-                raise RuntimeError(
-                    f"{entry.work_date}: the linked Xero Project could not be retrieved. "
-                    "Run Projects -> Sync from Xero, then retry. "
-                    f"Xero detail: {exc}"
-                ) from exc
-
-            if (live_project.get("projectId") or "").strip() != project_id:
-                raise RuntimeError(
-                    f"{entry.work_date}: Xero returned a different Project ID than expected. "
-                    "Run Projects -> Sync from Xero before retrying."
-                )
-
-            task = xero_find_or_create_task(project_id, description, token=token)
+                task = xero_find_or_create_task(project_id, description, token=token)
+            except RuntimeError as exc:
+                text = str(exc)
+                if "(404)" in text:
+                    raise RuntimeError(
+                        f"{entry.work_date}: the linked Xero Project is no longer available. "
+                        "Run Projects -> Sync from Xero, then retry. "
+                        f"Xero detail: {exc}"
+                    ) from exc
+                raise
             task_id = (task or {}).get("taskId")
             if not task_id:
                 raise RuntimeError(f"Xero did not return a Task ID for '{description[:100]}'.")
