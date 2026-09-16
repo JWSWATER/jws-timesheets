@@ -654,7 +654,8 @@ def save_timesheet():
                     timesheet_id=ts.id, work_date=entry_work_date,
                     start_time=e.get("start") or None, finish_time=e.get("finish") or None,
                     project_id=int(e["projectId"]) if e.get("projectId") else None,
-                    description=e.get("description", "")
+                    description=e.get("description", ""),
+                    xero_task_id=(e.get("xeroTaskId") or None),
                 ))
 
     if admin_amend:
@@ -2168,6 +2169,71 @@ def xero_get_project_tasks(project_id, token=None):
     return tasks
 
 
+def _xero_task_cache_key(project_id):
+    return f"xero_tasks:{project_id}"[:120]
+
+
+def _read_xero_task_cache(project_id):
+    raw = app_setting_get(_xero_task_cache_key(project_id))
+    if not raw:
+        return [], None
+    try:
+        payload = json.loads(raw)
+        items = payload.get("items") or []
+        fetched_at = _parse_utc(payload.get("fetched_at"))
+        return items, fetched_at
+    except Exception:
+        return [], None
+
+
+def _write_xero_task_cache(project_id, tasks):
+    items = []
+    for task in tasks or []:
+        task_id = (task.get("taskId") or "").strip()
+        name = (task.get("name") or "").strip()
+        if not task_id or not name:
+            continue
+        items.append({
+            "taskId": task_id,
+            "name": name,
+            "status": (task.get("status") or "ACTIVE").strip(),
+        })
+    app_setting_set(
+        _xero_task_cache_key(project_id),
+        json.dumps({"fetched_at": datetime.utcnow().isoformat(), "items": items}),
+    )
+    return items
+
+
+def xero_get_project_tasks_for_picker(project_id, token=None):
+    """Return Xero tasks for the employee picker with a short shared DB cache.
+
+    The picker should not hit Xero every time an employee focuses the Description
+    field. A short cache also protects the organisation from avoidable 429s.
+    If Xero is temporarily rate-limited and a previous cache exists, the stale
+    cache is still safe to offer as a suggestion list.
+    """
+    token = token or xero_access_token()
+    cached, fetched_at = _read_xero_task_cache(project_id)
+    try:
+        max_age = max(1, int(os.environ.get("XERO_TASK_PICKER_CACHE_MINUTES", "10")))
+    except ValueError:
+        max_age = 10
+    if cached and fetched_at and datetime.utcnow() - fetched_at < timedelta(minutes=max_age):
+        return cached
+
+    try:
+        live = xero_get_project_tasks(project_id, token=token)
+        items = _write_xero_task_cache(project_id, live)
+        db.session.commit()
+        return items
+    except Exception as exc:
+        db.session.rollback()
+        if cached and "429" in str(exc):
+            return cached
+        raise
+
+
 def _xero_idempotency(prefix, value):
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     return f"jws-{prefix}-{digest}"[:128]
@@ -2187,7 +2253,23 @@ def xero_find_or_create_task(project_id, description, token=None):
     task_name = full_description[:100]
     wanted = task_name.casefold()
 
-    for task in xero_get_project_tasks(project_id, token=token):
+    # Use the same short task cache as the employee picker first. This reduces
+    # repeated Xero calls when several rows use the same project.
+    cached_tasks = xero_get_project_tasks_for_picker(project_id, token=token)
+    for task in cached_tasks:
+        if (
+            (task.get("name") or "").strip().casefold() == wanted
+            and (task.get("status") or "ACTIVE") == "ACTIVE"
+        ):
+            return task
+
+    # Before creating a new task, refresh Xero once. This is deliberate: a task
+    # may have been created in Xero after the employee picker cache was filled,
+    # and we would rather wait/retry than create a near-duplicate task.
+    live_tasks = xero_get_project_tasks(project_id, token=token)
+    _write_xero_task_cache(project_id, live_tasks)
+    db.session.flush()
+    for task in live_tasks:
         if (
             (task.get("name") or "").strip().casefold() == wanted
             and (task.get("status") or "ACTIVE") == "ACTIVE"
@@ -2211,7 +2293,7 @@ def xero_find_or_create_task(project_id, description, token=None):
         "rate": {"currency": currency, "value": rate_value},
         "chargeType": charge_type,
     }
-    return xero_api_request(
+    created = xero_api_request(
         "POST",
         f"/Projects/{project_id}/Tasks",
         token=token,
@@ -2221,6 +2303,19 @@ def xero_find_or_create_task(project_id, description, token=None):
             f"{project_id}|{json.dumps(body, sort_keys=True, separators=(',', ':'))}"
         ),
     )
+    # Keep the picker cache aware of a task created by an export, so the next
+    # employee sees it immediately without waiting for the cache to expire.
+    if created and created.get("taskId"):
+        cached, _ = _read_xero_task_cache(project_id)
+        by_id = {item.get("taskId"): item for item in cached if item.get("taskId")}
+        by_id[created.get("taskId")] = {
+            "taskId": created.get("taskId"),
+            "name": created.get("name") or task_name,
+            "status": created.get("status") or "ACTIVE",
+        }
+        _write_xero_task_cache(project_id, list(by_id.values()))
+        db.session.flush()
+    return created
 
 
 def xero_resolve_project_user(employee, token=None):
@@ -2372,7 +2467,14 @@ def export_timesheet_to_xero_projects(ts):
             # linked project exists, and avoiding the redundant request greatly
             # reduces Xero API usage/rate-limit pressure during batch exports.
             try:
-                task = xero_find_or_create_task(project_id, description, token=token)
+                if entry.xero_task_id:
+                    # The employee explicitly selected an existing Xero task from
+                    # the project-specific picker. Trust that task ID and avoid a
+                    # second task-list lookup; Xero will reject the Time POST if
+                    # the task was subsequently removed.
+                    task = {"taskId": entry.xero_task_id, "projectId": project_id, "name": description[:100]}
+                else:
+                    task = xero_find_or_create_task(project_id, description, token=token)
             except RuntimeError as exc:
                 text = str(exc)
                 if "(404)" in text:
@@ -2621,6 +2723,35 @@ def api_projects():
         query = query.filter(Project.name.ilike(f"%{q}%"))
     rows = query.order_by(Project.name).limit(20).all()
     return jsonify([{"id": r.id, "external_id": r.external_id, "name": r.name} for r in rows])
+
+@app.get("/api/project-tasks")
+@login_required
+def api_project_tasks():
+    project_id = request.args.get("project_id", type=int)
+    q = (request.args.get("q") or "").strip().casefold()
+    if not project_id:
+        return jsonify([])
+
+    project = db.session.get(Project, project_id)
+    if not project or not project.active or project.source != "xero" or not project.external_id:
+        return jsonify([])
+
+    try:
+        tasks = xero_get_project_tasks_for_picker(project.external_id)
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:500]}), 503
+
+    rows = []
+    for task in tasks:
+        name = (task.get("name") or "").strip()
+        status = (task.get("status") or "ACTIVE").strip().upper()
+        if not name or status != "ACTIVE":
+            continue
+        if q and q not in name.casefold():
+            continue
+        rows.append({"id": task.get("taskId"), "name": name})
+    rows.sort(key=lambda item: item["name"].casefold())
+    return jsonify(rows[:20])
 
 @app.get("/history")
 @login_required

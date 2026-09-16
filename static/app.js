@@ -61,23 +61,89 @@ function bindRow(row) {
   row.querySelectorAll("input").forEach(input => input.addEventListener("input", recalc));
 
   const project = row.querySelector(".project-search");
-  const suggestions = row.querySelector(".project-suggestions");
+  const suggestions = row.querySelector(".project-suggestions:not(.task-suggestions)");
+  const description = row.querySelector(".description");
+  const taskSuggestions = row.querySelector(".task-suggestions");
+  let taskRequestSerial = 0;
 
-  project.addEventListener("input", async () => {
+  function closeTaskSuggestions() {
+    taskSuggestions.innerHTML = "";
+    taskSuggestions.classList.add("hidden");
+  }
+
+  async function loadTaskSuggestions() {
+    const projectId = project.dataset.projectId || "";
+    if (!projectId) {
+      closeTaskSuggestions();
+      return;
+    }
+
+    const serial = ++taskRequestSerial;
+    const q = encodeURIComponent(description.value || "");
+    try {
+      const response = await fetch(`/api/project-tasks?project_id=${encodeURIComponent(projectId)}&q=${q}`);
+      const data = await response.json();
+      if (serial !== taskRequestSerial) return;
+      if (!response.ok || !Array.isArray(data)) {
+        closeTaskSuggestions();
+        return;
+      }
+
+      taskSuggestions.innerHTML = data.map(item =>
+        `<button type="button" data-id="${item.id || ""}">${item.name}</button>`
+      ).join("");
+      taskSuggestions.classList.toggle("hidden", !data.length);
+      taskSuggestions.querySelectorAll("button").forEach(button => {
+        button.onclick = () => {
+          description.value = button.textContent;
+          description.dataset.xeroTaskId = button.dataset.id || "";
+          closeTaskSuggestions();
+        };
+      });
+    } catch (_) {
+      closeTaskSuggestions();
+    }
+  }
+
+  async function loadProjectSuggestions() {
     const q = encodeURIComponent(project.value);
-    const data = await fetch("/api/projects?q=" + q).then(response => response.json());
-    suggestions.innerHTML = data.map(item => `<button type="button" data-id="${item.id}">${item.name}</button>`).join("");
-    suggestions.classList.toggle("hidden", !data.length);
-    suggestions.querySelectorAll("button").forEach(button => {
-      button.onclick = () => {
-        project.value = button.textContent;
-        project.dataset.projectId = button.dataset.id;
-        suggestions.classList.add("hidden");
-      };
-    });
+    try {
+      const data = await fetch("/api/projects?q=" + q).then(response => response.json());
+      suggestions.innerHTML = data.map(item => `<button type="button" data-id="${item.id}">${item.name}</button>`).join("");
+      suggestions.classList.toggle("hidden", !data.length);
+      suggestions.querySelectorAll("button").forEach(button => {
+        button.onclick = () => {
+          project.value = button.textContent;
+          project.dataset.projectId = button.dataset.id;
+          description.dataset.xeroTaskId = "";
+          suggestions.classList.add("hidden");
+          closeTaskSuggestions();
+        };
+      });
+    } catch (_) {
+      suggestions.innerHTML = "";
+      suggestions.classList.add("hidden");
+    }
+  }
+
+  project.addEventListener("input", () => {
+    // Actual typing invalidates the previously selected project/task binding.
+    // Merely focusing an already-selected project does not.
+    project.dataset.projectId = "";
+    description.dataset.xeroTaskId = "";
+    closeTaskSuggestions();
+    loadProjectSuggestions();
   });
 
-  project.addEventListener("focus", () => project.dispatchEvent(new Event("input")));
+  project.addEventListener("focus", loadProjectSuggestions);
+
+  description.addEventListener("input", () => {
+    // Free typing means this may be a new task. Selecting a suggestion below
+    // will restore the exact Xero Task ID.
+    description.dataset.xeroTaskId = "";
+    loadTaskSuggestions();
+  });
+  description.addEventListener("focus", loadTaskSuggestions);
 
   row.querySelector(".delete-row").onclick = () => {
     const list = row.parentElement;
@@ -86,13 +152,14 @@ function bindRow(row) {
     } else {
       row.querySelectorAll("input").forEach(input => input.value = "");
       project.dataset.projectId = "";
+      description.dataset.xeroTaskId = "";
       suggestions.innerHTML = "";
       suggestions.classList.add("hidden");
+      closeTaskSuggestions();
     }
     recalc();
   };
 }
-
 document.querySelectorAll(".entry-row").forEach(bindRow);
 document.querySelectorAll(".break-input,.paid-hours-input").forEach(input => input.addEventListener("input", recalc));
 document.querySelectorAll(".public-holiday-input").forEach(input => input.addEventListener("change", recalc));
@@ -106,10 +173,12 @@ document.querySelectorAll(".add-row").forEach(button => {
     row.querySelectorAll("input").forEach(input => {
       input.value = "";
       if (input.classList.contains("project-search")) input.dataset.projectId = "";
+      if (input.classList.contains("description")) input.dataset.xeroTaskId = "";
     });
-    const suggestions = row.querySelector(".project-suggestions");
-    suggestions.innerHTML = "";
-    suggestions.classList.add("hidden");
+    row.querySelectorAll(".project-suggestions").forEach(suggestions => {
+      suggestions.innerHTML = "";
+      suggestions.classList.add("hidden");
+    });
     list.appendChild(row);
     bindRow(row);
   };
@@ -132,7 +201,8 @@ function payload(submit = false) {
         start: row.querySelector(".start").value,
         finish: row.querySelector(".finish").value,
         projectId: row.querySelector(".project-search").dataset.projectId || "",
-        description: row.querySelector(".description").value
+        description: row.querySelector(".description").value,
+        xeroTaskId: row.querySelector(".description").dataset.xeroTaskId || ""
       }))
     }))
   };
