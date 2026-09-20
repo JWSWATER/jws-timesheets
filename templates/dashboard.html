@@ -29,7 +29,7 @@
 <div class="entries"><div class="entry-head"><span>Start</span><span>Finish</span><span>Project</span><span>Description</span><span></span></div><div class="entry-list">
 {% for e in d.entries %}<div class="entry-row" data-work-date="{{ d.date }}"><input type="time" class="start" value="{{ e.start_time if e else '' }}"><input type="time" class="finish" value="{{ e.finish_time if e else '' }}">
 <div class="project-wrap"><input class="project-search" data-project-id="{{ e.project_id if e else '' }}" value="{{ e.project.name if e and e.project else '' }}" placeholder="Type project name or ref"><div class="project-suggestions hidden"></div></div>
-<div class="project-wrap task-wrap"><input class="description" data-xero-task-id="{{ e.xero_task_id if e else '' }}" value="{{ e.description if e else '' }}" placeholder="Search/select existing task or type new task"><div class="project-suggestions task-suggestions hidden"></div></div><button type="button" class="delete-row">🗑</button></div>{% endfor %}
+<div class="project-wrap task-wrap"><input class="description" data-xero-task-id="{{ (e.xero_task_id or '') if e else '' }}" value="{{ e.description if e else '' }}" placeholder="Search/select existing task or type new task"><div class="project-suggestions task-suggestions hidden"></div></div><button type="button" class="delete-row">🗑</button></div>{% endfor %}
 </div><button type="button" class="add-row">＋ Add another</button></div></div>{% endfor %}
 <div class="card week-summary">
 <div class="week-totals">

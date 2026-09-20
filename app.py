@@ -57,6 +57,25 @@ def format_hours_minutes(value):
 
 app.jinja_env.filters["hm"] = format_hours_minutes
 
+def normalise_xero_uuid(value):
+    """Return a clean Xero UUID string, or None for blank/invalid UI values.
+
+    HTML data attributes can otherwise turn Python None into the literal text
+    "None". Xero then receives an invalid taskId and reports that TaskId is
+    null/empty. Keep only real UUID-shaped identifiers.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in {"none", "null", "undefined", "nan"}:
+        return None
+    if not re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        text,
+    ):
+        return None
+    return text
+
 class User(db.Model):
     __tablename__ = "users"
     id = db.Column(db.Integer, primary_key=True)
@@ -655,7 +674,7 @@ def save_timesheet():
                     start_time=e.get("start") or None, finish_time=e.get("finish") or None,
                     project_id=int(e["projectId"]) if e.get("projectId") else None,
                     description=e.get("description", ""),
-                    xero_task_id=(e.get("xeroTaskId") or None),
+                    xero_task_id=normalise_xero_uuid(e.get("xeroTaskId")),
                 ))
 
     if admin_amend:
@@ -2467,12 +2486,19 @@ def export_timesheet_to_xero_projects(ts):
             # linked project exists, and avoiding the redundant request greatly
             # reduces Xero API usage/rate-limit pressure during batch exports.
             try:
-                if entry.xero_task_id:
+                selected_task_id = normalise_xero_uuid(entry.xero_task_id)
+                if entry.xero_task_id and not selected_task_id:
+                    # Repair legacy rows saved with literal values such as
+                    # "None"/"undefined" from an empty HTML data attribute.
+                    entry.xero_task_id = None
+                    db.session.flush()
+
+                if selected_task_id:
                     # The employee explicitly selected an existing Xero task from
-                    # the project-specific picker. Trust that task ID and avoid a
-                    # second task-list lookup; Xero will reject the Time POST if
+                    # the project-specific picker. Trust the valid UUID and avoid
+                    # a second task-list lookup; Xero will reject the Time POST if
                     # the task was subsequently removed.
-                    task = {"taskId": entry.xero_task_id, "projectId": project_id, "name": description[:100]}
+                    task = {"taskId": selected_task_id, "projectId": project_id, "name": description[:100]}
                 else:
                     task = xero_find_or_create_task(project_id, description, token=token)
             except RuntimeError as exc:
@@ -2484,9 +2510,12 @@ def export_timesheet_to_xero_projects(ts):
                         f"Xero detail: {exc}"
                     ) from exc
                 raise
-            task_id = (task or {}).get("taskId")
+            task_id = normalise_xero_uuid((task or {}).get("taskId"))
             if not task_id:
-                raise RuntimeError(f"Xero did not return a Task ID for '{description[:100]}'.")
+                raise RuntimeError(
+                    f"Xero did not return a valid Task ID for '{description[:100]}'. "
+                    "The time entry was not sent; refresh the project task list and retry."
+                )
 
             # A successful POST /Projects/{projectId}/Tasks returns the created
             # task object, including taskId/projectId. Trust that response rather
@@ -2749,7 +2778,10 @@ def api_project_tasks():
             continue
         if q and q not in name.casefold():
             continue
-        rows.append({"id": task.get("taskId"), "name": name})
+        task_id = normalise_xero_uuid(task.get("taskId"))
+        if not task_id:
+            continue
+        rows.append({"id": task_id, "name": name})
     rows.sort(key=lambda item: item["name"].casefold())
     return jsonify(rows[:20])
 
